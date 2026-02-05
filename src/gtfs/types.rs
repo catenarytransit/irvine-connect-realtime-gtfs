@@ -75,4 +75,42 @@ impl GtfsData {
             .map(|indices| indices.iter().map(|&i| &self.trips[i]).collect())
             .unwrap_or_default()
     }
+
+    pub fn get_trip_by_id(&self, trip_id: &str) -> Option<&Trip> {
+        self.trips.iter().find(|t| t.trip_id == trip_id)
+    }
+
+    /// Get the next trip in the same block, ordered by start time.
+    /// Returns None if this is the last trip in the block or trip not found.
+    pub fn get_next_trip_in_block(&self, current_trip_id: &str) -> Option<&Trip> {
+        let current_trip = self.get_trip_by_id(current_trip_id)?;
+        let block_indices = self.trips_by_block.get(&current_trip.block_id)?;
+
+        let current_idx = block_indices
+            .iter()
+            .position(|&i| self.trips[i].trip_id == current_trip_id)?;
+
+        if current_idx + 1 < block_indices.len() {
+            Some(&self.trips[block_indices[current_idx + 1]])
+        } else {
+            None
+        }
+    }
+
+    /// Get the previous trip in the same block, ordered by start time.
+    /// Returns None if this is the first trip in the block or trip not found.
+    pub fn get_previous_trip_in_block(&self, current_trip_id: &str) -> Option<&Trip> {
+        let current_trip = self.get_trip_by_id(current_trip_id)?;
+        let block_indices = self.trips_by_block.get(&current_trip.block_id)?;
+
+        let current_idx = block_indices
+            .iter()
+            .position(|&i| self.trips[i].trip_id == current_trip_id)?;
+
+        if current_idx > 0 {
+            Some(&self.trips[block_indices[current_idx - 1]])
+        } else {
+            None
+        }
+    }
 }

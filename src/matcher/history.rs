@@ -24,6 +24,10 @@ pub struct VehicleState {
     pub assigned_start_date: Option<String>,
     pub trip_confidence: f64,
     pub last_stop_visit_time: u64,
+    /// Trip ID of the previous trip in the block, for transition detection
+    pub previous_trip_id: Option<String>,
+    /// Timestamp when we last detected departure from terminus
+    pub last_terminus_departure: Option<u64>,
 }
 
 impl VehicleState {
@@ -37,6 +41,8 @@ impl VehicleState {
             assigned_start_date: None,
             trip_confidence: 0.0,
             last_stop_visit_time: 0,
+            previous_trip_id: None,
+            last_terminus_departure: None,
         }
     }
 
@@ -83,6 +89,21 @@ impl VehicleState {
         self.assigned_trip_id = None;
         self.assigned_start_date = None;
         self.trip_confidence = 0.0;
+    }
+
+    /// Called when we detect the vehicle has departed terminus on a new trip.
+    /// Preserves position history but marks the transition point.
+    pub fn transition_to_new_trip(&mut self, new_trip_id: &str, departure_timestamp: u64) {
+        self.previous_trip_id = self.assigned_trip_id.take();
+        self.assigned_trip_id = Some(new_trip_id.to_string());
+        self.last_terminus_departure = Some(departure_timestamp);
+        self.visited_stops.clear();
+        self.stop_visit_timestamps.clear();
+    }
+
+    /// Clear position history entirely (use when transitioning between blocks or long gaps)
+    pub fn clear_position_history(&mut self) {
+        self.position_history.clear();
     }
 }
 

@@ -16,6 +16,7 @@ pub struct VehicleState {
     pub vehicle_id: String,
     pub position_history: VecDeque<TimestampedPosition>,
     pub visited_stops: Vec<String>,
+    pub stop_visit_timestamps: Vec<(String, u64)>,
     pub assigned_trip_id: Option<String>,
     pub assigned_start_date: Option<String>,
     pub trip_confidence: f64,
@@ -28,6 +29,7 @@ impl VehicleState {
             vehicle_id,
             position_history: VecDeque::with_capacity(MAX_POSITION_HISTORY),
             visited_stops: Vec::new(),
+            stop_visit_timestamps: Vec::new(),
             assigned_trip_id: None,
             assigned_start_date: None,
             trip_confidence: 0.0,
@@ -66,12 +68,15 @@ impl VehicleState {
             .unwrap_or(true)
         {
             self.visited_stops.push(stop_id.to_string());
+            self.stop_visit_timestamps
+                .push((stop_id.to_string(), timestamp));
             self.last_stop_visit_time = timestamp;
         }
     }
 
     pub fn clear_for_new_trip(&mut self) {
         self.visited_stops.clear();
+        self.stop_visit_timestamps.clear();
         self.assigned_trip_id = None;
         self.assigned_start_date = None;
         self.trip_confidence = 0.0;

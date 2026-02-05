@@ -123,10 +123,13 @@ fn parse_stop_times(
         let stop_id = record.get(3).unwrap_or("").to_string();
         let sequence: u32 = record.get(4).unwrap_or("0").parse().unwrap_or(0);
 
+        let arrival_time_secs = parse_time_to_secs(&arrival_time);
+
         stop_times.entry(trip_id).or_default().push(StopTime {
             stop_id,
             sequence,
             arrival_time,
+            arrival_time_secs,
         });
     }
 
@@ -135,4 +138,16 @@ fn parse_stop_times(
     }
 
     Ok(stop_times)
+}
+
+fn parse_time_to_secs(time_str: &str) -> Option<u32> {
+    let parts: Vec<&str> = time_str.split(':').collect();
+    if parts.len() >= 2 {
+        let hours: u32 = parts[0].parse().ok()?;
+        let mins: u32 = parts[1].parse().ok()?;
+        let secs: u32 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        Some(hours * 3600 + mins * 60 + secs)
+    } else {
+        None
+    }
 }

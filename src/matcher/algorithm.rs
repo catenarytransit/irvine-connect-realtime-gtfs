@@ -157,42 +157,100 @@ fn score_trip_from_positions(state: &VehicleState, trip: &Trip, gtfs: &GtfsData)
         return 0.0;
     }
 
-    let trip_stop_ids: Vec<String> = trip.stop_times.iter().map(|st| st.stop_id.clone()).collect();
+    let trip_stop_ids: Vec<String> = trip
+        .stop_times
+        .iter()
+        .map(|st| st.stop_id.clone())
+        .collect();
 
-    let mut matched_stop_indices: Vec<usize> = Vec::new();
+    struct StopMatch {
+        stop_idx: usize,
+        position_timestamp: u64,
+        scheduled_secs: Option<u32>,
+    }
+
+    let mut matches: Vec<StopMatch> = Vec::new();
 
     for pos in &state.position_history {
         if let Some((stop_idx, _stop_id, _dist)) =
             find_nearest_stop_on_trip(pos.lat, pos.lon, &trip_stop_ids, gtfs)
         {
-            if matched_stop_indices.last() != Some(&stop_idx) {
-                matched_stop_indices.push(stop_idx);
+            if matches.last().map(|m| m.stop_idx) != Some(stop_idx) {
+                let scheduled_secs = trip
+                    .stop_times
+                    .get(stop_idx)
+                    .and_then(|st| st.arrival_time_secs);
+                matches.push(StopMatch {
+                    stop_idx,
+                    position_timestamp: pos.timestamp,
+                    scheduled_secs,
+                });
             }
         }
     }
 
-    if matched_stop_indices.is_empty() {
+    if matches.is_empty() {
         return 0.0;
     }
 
-    let unique_stops = matched_stop_indices.len();
+    let unique_stops = matches.len();
 
+    // Order score: longest increasing run
     let mut longest_increasing = 1;
     let mut current_run = 1;
-    for i in 1..matched_stop_indices.len() {
-        if matched_stop_indices[i] > matched_stop_indices[i - 1] {
+    for i in 1..matches.len() {
+        if matches[i].stop_idx > matches[i - 1].stop_idx {
             current_run += 1;
             longest_increasing = longest_increasing.max(current_run);
         } else {
             current_run = 1;
         }
     }
-
     let order_score = longest_increasing as f64 / unique_stops as f64;
+
+    // Time score: how well do position timestamps match scheduled times?
+    let mut time_scores: Vec<f64> = Vec::new();
+    for m in &matches {
+        if let Some(scheduled_secs) = m.scheduled_secs {
+            let pos_la = Los_Angeles
+                .timestamp_opt(m.position_timestamp as i64, 0)
+                .single();
+            if let Some(pos_time) = pos_la {
+                let observed_secs =
+                    (pos_time.hour() * 3600 + pos_time.minute() * 60 + pos_time.second()) as i32;
+                let scheduled = scheduled_secs as i32;
+                let delta = observed_secs - scheduled;
+
+                // Score based on time difference
+                // Perfect: within 2 minutes
+                // Good: within 10 minutes
+                // Acceptable: within 20 minutes
+                // Bad: beyond that
+                let ts = if delta.abs() <= 120 {
+                    1.0
+                } else if delta.abs() <= 600 {
+                    0.7
+                } else if delta.abs() <= 1200 {
+                    0.3
+                } else {
+                    0.0
+                };
+                time_scores.push(ts);
+            }
+        }
+    }
+
+    let avg_time_score = if time_scores.is_empty() {
+        0.5
+    } else {
+        time_scores.iter().sum::<f64>() / time_scores.len() as f64
+    };
 
     let coverage = unique_stops as f64 / trip.stop_times.len() as f64;
 
-    let raw_score = (unique_stops as f64).sqrt() * order_score * (0.3 + 0.7 * coverage);
+    // Combine: spatial matching, order, time accuracy, coverage
+    let raw_score =
+        (unique_stops as f64).sqrt() * order_score * avg_time_score * (0.3 + 0.7 * coverage);
 
     raw_score.min(1.0)
 }

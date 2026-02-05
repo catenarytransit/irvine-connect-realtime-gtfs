@@ -47,9 +47,9 @@ async fn fetch_and_process(
 
     let timestamp = feed.header.timestamp.unwrap_or_else(|| {
         std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     });
 
     let mut new_entities = Vec::new();
@@ -63,10 +63,10 @@ async fn fetch_and_process(
             if let Some(vehicle) = &entity.vehicle {
                 if let Some(position) = &vehicle.position {
                     let vehicle_id = vehicle
-                    .vehicle
-                    .as_ref()
-                    .and_then(|v| v.id.clone())
-                    .unwrap_or_else(|| entity.id.clone());
+                        .vehicle
+                        .as_ref()
+                        .and_then(|v| v.id.clone())
+                        .unwrap_or_else(|| entity.id.clone());
 
                     let state = state_manager.get_or_create(&vehicle_id);
 
@@ -88,15 +88,15 @@ async fn fetch_and_process(
         // Pass 3: Construct new feed entities with assigned trips
         for entity in &feed.entity {
             if let Some(vehicle) = &entity.vehicle {
-                 // Re-derive ID to look up state
-                 let vehicle_id = vehicle
+                // Re-derive ID to look up state
+                let vehicle_id = vehicle
                     .vehicle
                     .as_ref()
                     .and_then(|v| v.id.clone())
                     .unwrap_or_else(|| entity.id.clone());
 
                 if let Some(state) = state_manager.get(&vehicle_id) {
-                     let new_vehicle = create_enhanced_vehicle(
+                    let new_vehicle = create_enhanced_vehicle(
                         vehicle,
                         state.assigned_trip_id.as_deref(),
                         state.assigned_start_date.as_deref(),

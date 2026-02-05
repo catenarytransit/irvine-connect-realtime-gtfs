@@ -4,10 +4,22 @@ mod matcher;
 mod api;
 
 use std::sync::Arc;
+use clap::Parser;
 use tokio::sync::RwLock;
+
+#[derive(Parser)]
+#[command(name = "irvine-connect-realtime-gtfs")]
+#[command(about = "GTFS-RT service for Irvine Connect")]
+struct Args {
+    /// Port to run the HTTP server on
+    #[arg(short, long, env = "SERVER_PORT", default_value = "8080")]
+    port: u16,
+}
 
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
+    
     println!("Starting Irvine Connect GTFS-RT service...");
     
     let gtfs_data = match gtfs::loader::load_gtfs().await {
@@ -33,8 +45,9 @@ async fn main() {
     });
     
     let api_feed = current_feed.clone();
+    let port = args.port;
     let api_handle = tokio::spawn(async move {
-        api::server::run_server(api_feed).await;
+        api::server::run_server(api_feed, port).await;
     });
     
     tokio::select! {

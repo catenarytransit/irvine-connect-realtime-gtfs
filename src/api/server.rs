@@ -8,10 +8,9 @@ use axum::{
 use tokio::sync::RwLock;
 use prost::Message;
 
-const SERVER_PORT: u16 = 8080;
-
 pub async fn run_server(
     current_feed: Arc<RwLock<Option<gtfs_realtime::FeedMessage>>>,
+    port: u16,
 ) {
     let app = Router::new()
         .route("/gtfs-rt/vehicle-positions", get({
@@ -20,7 +19,7 @@ pub async fn run_server(
         }))
         .route("/health", get(health_check));
     
-    let addr = format!("0.0.0.0:{}", SERVER_PORT);
+    let addr = format!("0.0.0.0:{}", port);
     println!("Starting HTTP server on {}", addr);
     
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

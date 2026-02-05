@@ -105,6 +105,10 @@ impl VehicleStateManager {
         self.states.get(vehicle_id)
     }
 
+    pub fn get_mut(&mut self, vehicle_id: &str) -> Option<&mut VehicleState> {
+        self.states.get_mut(vehicle_id)
+    }
+
     pub fn all_states(&self) -> impl Iterator<Item = &VehicleState> {
         self.states.values()
     }

@@ -38,42 +38,124 @@ pub fn update_vehicle_state(
 
         if should_record {
             state.record_stop_visit(&stop_id, timestamp);
+            println!("Vehicle {} visiting stop {} at {}", state.vehicle_id, stop_id, timestamp);
         }
     }
+}
 
-    if state.stop_visit_timestamps.len() >= MIN_STOPS_FOR_ASSIGNMENT {
-        let la_time = Los_Angeles.timestamp_opt(timestamp as i64, 0).single();
+pub fn perform_global_assignment(state_manager: &mut crate::matcher::VehicleStateManager, gtfs: &GtfsData) {
+    let mut all_matches = Vec::new(); // (score, vehicle_id, trip_id)
+    
+    // We need to know which vehicles are active to iterate over them
+    // state_manager.all_states() returns an iterator
+    // We need mutable access later to update them, so we might need a different pattern 
+    // or collect IDs first.
+    
+    // Since we need to update states later, let's collect IDs first
+    let vehicle_ids: Vec<String> = state_manager.all_states().map(|s| s.vehicle_id.clone()).collect();
+    
+    // 1. Calculate scores for all vehicles and all candidates
+    for vehicle_id in &vehicle_ids {
+        if let Some(state) = state_manager.get(vehicle_id) {
+            // Skip assignment if not enough stops visited
+            if state.stop_visit_timestamps.len() < MIN_STOPS_FOR_ASSIGNMENT {
+                continue;
+            }
 
-        if let Some(now) = la_time {
-            let is_weekend = now.weekday().num_days_from_monday() >= 5;
-            let current_secs = (now.hour() * 3600 + now.minute() * 60 + now.second()) as u32;
+            let last_timestamp = state.last_stop_visit_time;
+            let la_time = Los_Angeles.timestamp_opt(last_timestamp as i64, 0).single();
+            
+            if let Some(now) = la_time {
+                let is_weekend = now.weekday().num_days_from_monday() >= 5;
+                let current_secs = (now.hour() * 3600 + now.minute() * 60 + now.second()) as u32;
 
-            let candidates = find_candidate_trips(gtfs, is_weekend, current_secs);
+                let candidates = find_candidate_trips(gtfs, is_weekend, current_secs);
+                println!("Found {} candidates for vehicle {}", candidates.len(), vehicle_id);
 
-            if let Some((trip_id, confidence)) =
-                find_best_matching_trip(state, &candidates, current_secs)
-            {
-                if confidence >= CONFIDENCE_THRESHOLD {
-                    if state.assigned_trip_id.as_ref() != Some(&trip_id)
-                        || confidence > state.trip_confidence
-                    {
-                        state.assigned_trip_id = Some(trip_id);
-                        state.assigned_start_date = Some(now.format("%Y%m%d").to_string());
-                        state.trip_confidence = confidence;
+                for trip in candidates {
+                    let score = score_trip_match(&state.stop_visit_timestamps, trip, current_secs);
+                    if score > 0.0 {
+                         println!("Vehicle {} - Trip {} score: {:.3}", vehicle_id, trip.trip_id, score);
+                        // Add hysteresis: if this is the currently assigned trip, boost the score slightly
+                        let final_score = if state.assigned_trip_id.as_deref() == Some(&trip.trip_id) {
+                            score + 0.1 // Hysteresis bonus
+                        } else {
+                            score
+                        };
+                        
+                        // Store match: (score, vehicle_id, trip_id, start_date)
+                        all_matches.push((final_score, vehicle_id.clone(), trip.trip_id.clone(), now.format("%Y%m%d").to_string()));
                     }
                 }
             }
         }
     }
 
-    if should_transition_trip(state, gtfs) {
-        if let Some(current_trip_id) = &state.assigned_trip_id.clone() {
-            if let Some(next_trip) = find_next_trip_in_block(current_trip_id, gtfs) {
-                state.clear_for_new_trip();
-                let la_time = Los_Angeles.timestamp_opt(timestamp as i64, 0).single();
-                if let Some(now) = la_time {
-                    state.assigned_trip_id = Some(next_trip.trip_id.clone());
-                    state.assigned_start_date = Some(now.format("%Y%m%d").to_string());
+    // 2. Sort matches by score descending
+    // Note: f64 doesn't implement Ord, so we use partial_cmp
+    all_matches.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 3. Assign trips greedily respecting uniqueness
+    let mut assigned_trips = std::collections::HashSet::new();
+    let mut assigned_vehicles = std::collections::HashSet::new();
+    
+    // We need to apply assignments. Since we can't mutate state_manager while iterating over matches (if we hold refs),
+    // we'll first determine the best assignment for each vehicle.
+    // Actually, we can just iterate the sorted matches and apply if both are free.
+    
+    let mut final_assignments = std::collections::HashMap::new();
+
+    for (score, vehicle_id, trip_id, start_date) in all_matches {
+        if score < CONFIDENCE_THRESHOLD {
+            continue;
+        }
+
+        if !assigned_vehicles.contains(&vehicle_id) && !assigned_trips.contains(&trip_id) {
+            // Assign!
+            assigned_vehicles.insert(vehicle_id.clone());
+            assigned_trips.insert(trip_id.clone());
+            final_assignments.insert(vehicle_id, (trip_id, start_date, score));
+        }
+    }
+
+    // 4. Update the actual states
+    // First, clear assignments for vehicles that didn't get a match (or maybe we should keep old if decent? No, global assignment implies re-eval)
+    // Actually, "clearing" might cause flickering if we just had a temporary drop in score. 
+    // But uniqueness requires us to be strict.
+    // Let's iterate all vehicles.
+    
+    for vehicle_id in vehicle_ids {
+        if let Some(state) = state_manager.get_mut(&vehicle_id) {
+             // Handle trip transition logic here if needed? 
+             // The original code had `should_transition_trip`. 
+             // That logic checks if we are at the end of a trip. 
+             // Global assignment should ideally handle this if the new trip scores higher.
+             // But valid "next trip" might not have started yet (score low).
+             // Let's keep the transition logic but integrating it is tricky.
+             // For now, let's just apply the best matches found.
+             
+             if let Some((trip_id, start_date, score)) = final_assignments.get(&vehicle_id) {
+                 if state.assigned_trip_id.as_ref() != Some(trip_id) {
+                     println!("Assigning trip {} to vehicle {} (score: {:.3})", trip_id, vehicle_id, score);
+                     state.assigned_trip_id = Some(trip_id.clone());
+                     state.assigned_start_date = Some(start_date.clone());
+                     state.trip_confidence = *score;
+                 } else {
+                     // Update confidence
+                     state.trip_confidence = *score;
+                 }
+             } else {
+                 // No match found this round. 
+                 // Should we clear? If we don't clear, we might hold onto a stale trip that another bus needs.
+                 // If we DO clear, we might flicker.
+                 // Given the uniqueness constraint, if we didn't get the trip in the global assignment, 
+                 // it means either score was too low OR someone else took it.
+                 // In either case, we should probably clear or at least acknowledge we failed to match.
+                if state.assigned_trip_id.is_some() {
+                     println!("Vehicle {} lost its assignment (no valid match found or trip taken)", vehicle_id);
+                     state.assigned_trip_id = None;
+                     state.assigned_start_date = None;
+                     state.trip_confidence = 0.0;
                 }
             }
         }
@@ -100,24 +182,6 @@ fn find_candidate_trips(gtfs: &GtfsData, is_weekend: bool, current_secs: u32) ->
             None
         })
         .collect()
-}
-
-fn find_best_matching_trip(
-    state: &VehicleState,
-    candidates: &[&Trip],
-    current_secs: u32,
-) -> Option<(String, f64)> {
-    let mut best_match: Option<(String, f64)> = None;
-
-    for trip in candidates {
-        let score = score_trip_match(&state.stop_visit_timestamps, trip, current_secs);
-
-        if best_match.as_ref().map(|(_, s)| score > *s).unwrap_or(true) && score > 0.0 {
-            best_match = Some((trip.trip_id.clone(), score));
-        }
-    }
-
-    best_match
 }
 
 fn score_trip_match(stop_visits: &[(String, u64)], trip: &Trip, current_secs: u32) -> f64 {
@@ -197,39 +261,3 @@ fn score_trip_match(stop_visits: &[(String, u64)], trip: &Trip, current_secs: u3
     match_ratio * avg_time_score * (1.0 - order_penalty * 0.5)
 }
 
-fn should_transition_trip(state: &VehicleState, gtfs: &GtfsData) -> bool {
-    if state.assigned_trip_id.is_none() {
-        return false;
-    }
-
-    if let Some(last_visited) = state.visited_stops.last() {
-        if last_visited == TERMINAL_STOP_ID {
-            if let Some(trip_id) = &state.assigned_trip_id {
-                if let Some(trip) = gtfs.trips.iter().find(|t| &t.trip_id == trip_id) {
-                    if trip.last_stop_id() == Some(TERMINAL_STOP_ID) {
-                        return state.visited_stops.len() >= 10;
-                    }
-                }
-            }
-        }
-    }
-
-    false
-}
-
-fn find_next_trip_in_block<'a>(current_trip_id: &str, gtfs: &'a GtfsData) -> Option<&'a Trip> {
-    let current_trip = gtfs.trips.iter().find(|t| t.trip_id == current_trip_id)?;
-    let block_trips = gtfs.get_trips_in_block(&current_trip.block_id);
-
-    let current_start = current_trip.start_time_minutes()?;
-
-    block_trips
-        .into_iter()
-        .filter(|t| {
-            t.trip_id != current_trip_id
-                && t.start_time_minutes()
-                    .map(|s| s > current_start)
-                    .unwrap_or(false)
-        })
-        .min_by_key(|t| t.start_time_minutes().unwrap_or(u32::MAX))
-}

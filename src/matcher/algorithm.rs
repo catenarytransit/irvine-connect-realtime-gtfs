@@ -99,6 +99,24 @@ pub fn perform_global_assignment(
                 let terminus_visits = find_terminus_visits(state, gtfs);
                 let segment_start = find_segment_boundary(&terminus_visits, state, gtfs);
 
+                // Infer current trip from pre-segment history
+                // If pre-segment matches late stops of trip T-1, the current trip is T
+                let inferred_trip = if let Some(seg_start) = segment_start {
+                    infer_trip_from_pre_segment(state, gtfs, seg_start, is_weekend)
+                } else {
+                    None
+                };
+
+                if let Some(ref inferred) = inferred_trip {
+                    println!(
+                        "Vehicle {} - Inferred current trip {} from pre-segment history",
+                        vehicle_id, inferred.trip_id
+                    );
+                    if !candidates.iter().any(|t| t.trip_id == inferred.trip_id) {
+                        candidates.push(inferred);
+                    }
+                }
+
                 for trip in &candidates {
                     let (score, transition_detected) = score_trip_with_segmentation(
                         state,
@@ -114,6 +132,18 @@ pub fn perform_global_assignment(
                         // Stability bonus for staying on same trip
                         if state.assigned_trip_id.as_deref() == Some(&trip.trip_id) {
                             final_score += 0.05;
+                        }
+
+                        // Strong bonus if this trip was inferred from pre-segment history + departure time
+                        if inferred_trip
+                            .as_ref()
+                            .map_or(false, |inf| inf.trip_id == trip.trip_id)
+                        {
+                            println!(
+                                "Vehicle {} - Boosting {} (inferred from pre-segment + departure time)",
+                                vehicle_id, trip.trip_id
+                            );
+                            final_score *= 2.0;
                         }
 
                         // Transition bonus when we detect movement from previous trip to this one
@@ -322,6 +352,79 @@ fn find_segment_boundary(
         .rev()
         .find(|v| v.visit_type == TerminusVisitType::Departing)
         .map(|v| v.position_idx)
+}
+
+/// Infer the current trip from pre-segment history.
+/// Uses the pre-segment positions to find which trip the vehicle was on (T-1),
+/// then returns the next trip in the block (T).
+/// Also validates using terminus departure time against scheduled times.
+fn infer_trip_from_pre_segment<'a>(
+    state: &VehicleState,
+    gtfs: &'a GtfsData,
+    segment_start: usize,
+    is_weekend: bool,
+) -> Option<&'a Trip> {
+    if segment_start == 0 {
+        return None;
+    }
+
+    // Get the timestamp when we departed the terminus
+    let departure_timestamp = state.position_history.get(segment_start)?.timestamp;
+    let departure_la = Los_Angeles
+        .timestamp_opt(departure_timestamp as i64, 0)
+        .single()?;
+    let departure_secs =
+        (departure_la.hour() * 3600 + departure_la.minute() * 60 + departure_la.second()) as u32;
+
+    // Score each active trip's pre-segment match
+    let trip_indices = gtfs.get_active_trips(is_weekend);
+
+    let mut best_match: Option<(&Trip, f64)> = None;
+
+    for &idx in trip_indices {
+        let trip = &gtfs.trips[idx];
+        let trip_stop_ids: Vec<String> = trip
+            .stop_times
+            .iter()
+            .map(|st| st.stop_id.clone())
+            .collect();
+
+        // Count how many pre-segment positions match late stops of this trip
+        let late_stop_matches: usize = state
+            .position_history
+            .iter()
+            .take(segment_start)
+            .filter_map(|pos| {
+                find_nearest_stop_on_trip(pos.lat, pos.lon, &trip_stop_ids, gtfs)
+                    .map(|(idx, _, _)| idx)
+            })
+            .filter(|&idx| idx >= LATE_STOP_THRESHOLD)
+            .count();
+
+        if late_stop_matches >= 2 {
+            // This trip is a candidate for T-1
+            // Check if departure time matches the NEXT trip in this block
+            if let Some(next_trip) = gtfs.get_next_trip_in_block(&trip.trip_id) {
+                // Get scheduled departure time of next trip (first stop)
+                if let Some(scheduled_secs) = next_trip
+                    .stop_times
+                    .first()
+                    .and_then(|st| st.arrival_time_secs)
+                {
+                    // Allow 15 minute window for departure time match
+                    let time_diff = (departure_secs as i32 - scheduled_secs as i32).abs();
+                    if time_diff <= 900 {
+                        let score = late_stop_matches as f64 + (1.0 - time_diff as f64 / 900.0);
+                        if best_match.as_ref().map_or(true, |(_, s)| score > *s) {
+                            best_match = Some((next_trip, score));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    best_match.map(|(trip, _)| trip)
 }
 
 /// Score a trip using segmented history

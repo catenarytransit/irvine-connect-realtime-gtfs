@@ -1,4 +1,4 @@
-use crate::gtfs::{GtfsData, Stop};
+use crate::gtfs::GtfsData;
 
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
 const STOP_RADIUS_METERS: f64 = 50.0;
@@ -16,31 +16,24 @@ pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     EARTH_RADIUS_M * c
 }
 
-pub fn find_nearby_stops(lat: f64, lon: f64, gtfs: &GtfsData) -> Vec<(String, f64)> {
-    let mut nearby = Vec::new();
+pub fn find_nearest_stop_on_trip(
+    lat: f64,
+    lon: f64,
+    trip_stop_ids: &[String],
+    gtfs: &GtfsData,
+) -> Option<(usize, String, f64)> {
+    let mut best: Option<(usize, String, f64)> = None;
 
-    for stop in gtfs.stops.values() {
-        let dist = haversine_distance(lat, lon, stop.lat, stop.lon);
-        if dist <= STOP_RADIUS_METERS {
-            nearby.push((stop.id.clone(), dist));
+    for (idx, stop_id) in trip_stop_ids.iter().enumerate() {
+        if let Some(stop) = gtfs.stops.get(stop_id) {
+            let dist = haversine_distance(lat, lon, stop.lat, stop.lon);
+            if dist <= STOP_RADIUS_METERS {
+                if best.as_ref().map_or(true, |(_, _, d)| dist < *d) {
+                    best = Some((idx, stop_id.clone(), dist));
+                }
+            }
         }
     }
 
-    nearby.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-    nearby
-}
-
-pub fn find_nearest_stop(lat: f64, lon: f64, gtfs: &GtfsData) -> Option<(String, f64)> {
-    find_nearby_stops(lat, lon, gtfs).into_iter().next()
-}
-
-pub fn is_stop_directional(stop: &Stop) -> Option<bool> {
-    let name = &stop.name;
-    if name.ends_with(" IB") || name.contains(" IB ") {
-        Some(true)
-    } else if name.ends_with(" OB") || name.contains(" OB ") {
-        Some(false)
-    } else {
-        None
-    }
+    best
 }

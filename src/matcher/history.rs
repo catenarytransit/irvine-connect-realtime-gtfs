@@ -1,9 +1,12 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
 
 const HISTORY_DURATION_SECS: u64 = 20 * 60;
 const MAX_POSITION_HISTORY: usize = 1200;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimestampedPosition {
     pub lat: f64,
     pub lon: f64,
@@ -11,7 +14,7 @@ pub struct TimestampedPosition {
     pub timestamp: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VehicleState {
     pub vehicle_id: String,
     pub position_history: VecDeque<TimestampedPosition>,
@@ -83,7 +86,7 @@ impl VehicleState {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct VehicleStateManager {
     states: HashMap<String, VehicleState>,
 }
@@ -93,6 +96,20 @@ impl VehicleStateManager {
         Self {
             states: HashMap::new(),
         }
+    }
+
+    pub fn load(path: &str) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let states = serde_json::from_reader(reader)?;
+        Ok(states)
+    }
+
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        let file = File::create(path)?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer(writer, self)?;
+        Ok(())
     }
 
     pub fn get_or_create(&mut self, vehicle_id: &str) -> &mut VehicleState {

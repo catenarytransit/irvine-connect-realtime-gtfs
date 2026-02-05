@@ -20,6 +20,8 @@ pub async fn run_fetcher(
     );
     let client = reqwest::Client::new();
 
+    let mut current_iteration = 0;
+
     loop {
         match fetch_and_process(&client, &gtfs, &states, &current_feed).await {
             Ok(count) => {
@@ -27,6 +29,16 @@ pub async fn run_fetcher(
             }
             Err(e) => {
                 eprintln!("Fetch error: {}", e);
+            }
+        }
+
+        current_iteration += 1;
+        if current_iteration % 30 == 0 {
+            let state_manager = states.read().await;
+            if let Err(e) = state_manager.save("vehicle_state.json") {
+                eprintln!("Failed to save vehicle state: {}", e);
+            } else {
+                println!("Saved vehicle state");
             }
         }
 

@@ -37,7 +37,16 @@ async fn main() {
         }
     };
 
-    let vehicle_states = Arc::new(RwLock::new(matcher::VehicleStateManager::new()));
+    let vehicle_states = match matcher::VehicleStateManager::load("vehicle_state.json") {
+        Ok(states) => {
+            println!("Loaded vehicle state from disk");
+            Arc::new(RwLock::new(states))
+        }
+        Err(e) => {
+            eprintln!("Could not load vehicle state: {} (starting fresh)", e);
+            Arc::new(RwLock::new(matcher::VehicleStateManager::new()))
+        }
+    };
     let current_feed = Arc::new(RwLock::new(None::<gtfs_realtime::FeedMessage>));
 
     let fetcher_gtfs = gtfs_data.clone();

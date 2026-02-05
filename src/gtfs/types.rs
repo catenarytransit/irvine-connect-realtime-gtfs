@@ -27,13 +27,15 @@ impl Trip {
     pub fn first_stop_id(&self) -> Option<&str> {
         self.stop_times.first().map(|st| st.stop_id.as_str())
     }
-    
+
     pub fn last_stop_id(&self) -> Option<&str> {
         self.stop_times.last().map(|st| st.stop_id.as_str())
     }
-    
+
     pub fn start_time_minutes(&self) -> Option<u32> {
-        self.stop_times.first().and_then(|st| parse_time_to_minutes(&st.arrival_time))
+        self.stop_times
+            .first()
+            .and_then(|st| parse_time_to_minutes(&st.arrival_time))
     }
 }
 
@@ -65,7 +67,7 @@ impl GtfsData {
             &self.weekday_trips
         }
     }
-    
+
     pub fn get_trips_in_block(&self, block_id: &str) -> Vec<&Trip> {
         self.trips_by_block
             .get(block_id)

@@ -18,14 +18,14 @@ pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 
 pub fn find_nearby_stops(lat: f64, lon: f64, gtfs: &GtfsData) -> Vec<(String, f64)> {
     let mut nearby = Vec::new();
-    
+
     for stop in gtfs.stops.values() {
         let dist = haversine_distance(lat, lon, stop.lat, stop.lon);
         if dist <= STOP_RADIUS_METERS {
             nearby.push((stop.id.clone(), dist));
         }
     }
-    
+
     nearby.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
     nearby
 }

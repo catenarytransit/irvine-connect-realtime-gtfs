@@ -52,7 +52,7 @@ fn generate_single_trip_update(
     trip_update.vehicle = Some(gtfs_realtime::VehicleDescriptor {
         id: Some(
             state
-                .source_id
+                .label
                 .clone()
                 .unwrap_or_else(|| state.vehicle_id.clone()),
         ),

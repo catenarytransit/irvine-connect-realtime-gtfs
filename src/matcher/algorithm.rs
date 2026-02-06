@@ -363,7 +363,7 @@ pub fn perform_global_assignment(
                             .back()
                             .map(|p| p.timestamp)
                             .unwrap_or(0);
-                        state.transition_to_new_trip(trip_id.clone(), timestamp);
+                        state.transition_to_new_trip(trip_id.as_str(), timestamp);
                         state.route_id = route_id.clone();
                         state.assigned_start_date = Some(start_date.clone());
                         state.trip_confidence = *score;

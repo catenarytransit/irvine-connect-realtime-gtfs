@@ -3,6 +3,7 @@ use crate::matcher::history::VehicleState;
 use crate::matcher::proximity::{find_nearest_stop_on_trip, haversine_distance};
 use chrono::{Datelike, TimeZone, Timelike};
 use chrono_tz::America::Los_Angeles;
+use std::time::SystemTime;
 
 const MIN_POSITIONS_FOR_MATCHING: usize = 5;
 const CONFIDENCE_THRESHOLD: f64 = 0.05;
@@ -470,7 +471,7 @@ fn infer_trip_from_pre_segment<'a>(
     best_match.map(|(trip, _)| trip)
 }
 
-/// Score a trip using segmented history
+/// Score a trip using segmented history with greedy monotonic matching
 fn score_trip_with_segmentation(
     state: &VehicleState,
     trip: &Trip,
@@ -482,131 +483,156 @@ fn score_trip_with_segmentation(
         return (0.0, false);
     }
 
-    let trip_stop_ids: Vec<String> = trip
-        .stop_times
-        .iter()
-        .map(|st| st.stop_id.clone())
-        .collect();
-
-    struct StopMatch {
-        stop_idx: usize,
-        position_timestamp: u64,
-        scheduled_secs: Option<u32>,
-    }
-
     let start_idx = segment_start.unwrap_or(0);
-    let mut matches: Vec<StopMatch> = Vec::new();
-
-    for pos in state.position_history.iter().skip(start_idx) {
-        if let Some((stop_idx, _stop_id, _dist)) =
-            find_nearest_stop_on_trip(pos.lat, pos.lon, &trip_stop_ids, gtfs)
-        {
-            if matches.last().map(|m| m.stop_idx) != Some(stop_idx) {
-                let scheduled_secs = trip
-                    .stop_times
-                    .get(stop_idx)
-                    .and_then(|st| st.arrival_time_secs);
-                matches.push(StopMatch {
-                    stop_idx,
-                    position_timestamp: pos.timestamp,
-                    scheduled_secs,
-                });
-            }
-        }
-    }
-
-    if matches.is_empty() {
+    // If we have very little history to work with, we can't be confident
+    if state.position_history.len() - start_idx < MIN_POSITIONS_FOR_MATCHING {
         return (0.0, false);
     }
 
-    let unique_stops = matches.len();
+    let stop_times = &trip.stop_times;
 
-    // Order score: longest increasing run
-    let mut longest_increasing = 1;
-    let mut current_run = 1;
-    for i in 1..matches.len() {
-        if matches[i].stop_idx > matches[i - 1].stop_idx {
-            current_run += 1;
-            longest_increasing = longest_increasing.max(current_run);
+    // Matched stops: Vec of (stop_index, timestamp_of_visit)
+    // We use the same greedy monotonic logic as in updates.rs
+    let mut matched_stops: Vec<Option<u64>> = vec![None; stop_times.len()];
+    let mut last_matched_sequence_idx = 0;
+
+    let history_slice: Vec<_> = state.position_history.iter().skip(start_idx).collect();
+
+    // Need date string for scheduled timestamp calculation.
+    // If not assigned yet, use today in LA.
+    let date_str = if let Some(d) = &state.assigned_start_date {
+        d.clone()
+    } else {
+        // Fallback to today
+        let now = SystemTime::now();
+        // We really want the date of the position timestamps usually, but
+        // for candidate scoring we are usually looking at "now" or recent.
+        // Let's assume the trip runs "today" relative to the vehicle positions.
+        // A better approx is taking the last position timestamp.
+        if let Some(last_pos) = history_slice.last() {
+            Los_Angeles
+                .timestamp_opt(last_pos.timestamp as i64, 0)
+                .single()
+                .map(|dt| dt.format("%Y%m%d").to_string())
+                .unwrap_or_else(|| "20240101".to_string())
         } else {
-            current_run = 1;
+            "20240101".to_string()
         }
-    }
-    let order_score = longest_increasing as f64 / unique_stops as f64;
+    };
 
-    // Time score: how well do position timestamps match scheduled times?
-    let mut weighted_time_score_sum = 0.0;
-    let mut total_weight = 0.0;
-    let mut total_delta_sum = 0;
-    let mut delta_count = 0;
+    for pos in &history_slice {
+        let mut best_match: Option<(usize, u64)> = None;
+        let mut best_dist = 100.0; // Max radius matches updates.rs logic approximately
 
-    // Find the latest timestamp in the matches to use as a reference for recency
-    let latest_timestamp = matches
-        .iter()
-        .map(|m| m.position_timestamp)
-        .max()
-        .unwrap_or(0);
+        // Search lookahead
+        let search_end = (last_matched_sequence_idx + 10).min(stop_times.len());
 
-    for m in &matches {
-        if let Some(scheduled_secs) = m.scheduled_secs {
-            let pos_la = Los_Angeles
-                .timestamp_opt(m.position_timestamp as i64, 0)
-                .single();
-            if let Some(pos_time) = pos_la {
-                let observed_secs =
-                    (pos_time.hour() * 3600 + pos_time.minute() * 60 + pos_time.second()) as i32;
-                let scheduled = scheduled_secs as i32;
-                let delta = observed_secs - scheduled;
+        for idx in last_matched_sequence_idx..search_end {
+            let st = &stop_times[idx];
+            if let Some(stop) = gtfs.stops.get(&st.stop_id) {
+                let dist = haversine_distance(pos.lat, pos.lon, stop.lat, stop.lon);
+                // 80 meters radius, consistent with typical bus stop radius
+                if dist < 80.0 && dist < best_dist {
+                    best_match = Some((idx, pos.timestamp));
+                    best_dist = dist;
+                }
+            }
+        }
 
-                // Accumulate total delta for average calculation
-                total_delta_sum += delta;
-                delta_count += 1;
-
-                // Calculate weight based on recency
-                // Maps 0-300s (5 mins) ago to 1.0, then linearly decays to 0.2 at 20 mins ago
-                let seconds_ago = if latest_timestamp > m.position_timestamp {
-                    latest_timestamp - m.position_timestamp
-                } else {
-                    0
-                };
-
-                let weight = if seconds_ago <= 300 {
-                    1.0
-                } else if seconds_ago <= 1200 {
-                    // Decay from 1.0 to 0.2
-                    1.0 - (0.8 * (seconds_ago - 300) as f64 / 900.0)
-                } else {
-                    0.2
-                };
-
-                // typically vehicles run more late than early but a few min early is also acceptable to them
-                // Adjusted to be more symmetrical relative to zero, but biased towards lateness
-                let ts = if delta >= -300 && delta <= 600 {
-                    // Up to 5 mins early, or 10 mins late
-                    1.0
-                } else if delta >= -600 && delta <= 1200 {
-                    // Up to 10 mins early, or 20 mins late
-                    0.7
-                } else if delta >= -1200 && delta <= 1800 {
-                    // Up to 20 mins early, or 30 mins late
-                    0.3
-                } else {
-                    0.0
-                };
-
-                weighted_time_score_sum += ts * weight;
-                total_weight += weight;
+        if let Some((idx, ts)) = best_match {
+            if idx >= last_matched_sequence_idx {
+                last_matched_sequence_idx = idx;
+                // Capture the FIRST time we hit this stop in the sequence (arrival)
+                if matched_stops[idx].is_none() {
+                    matched_stops[idx] = Some(ts);
+                }
             }
         }
     }
 
-    // Strict cutoff: if average delay is > 30 minutes (1800s) or < -30 minutes, force score to 0
-    // This prevents matching trips that are spatially correct but wildly off in time (e.g. 2 hours late)
+    let unique_stops_matched = matched_stops.iter().filter(|m| m.is_some()).count();
+
+    if unique_stops_matched == 0 {
+        return (0.0, false);
+    }
+
+    // Calculate time conformance
+    let mut total_delta_sum = 0.0;
+    let mut delta_count = 0;
+    let mut weighted_score_sum = 0.0;
+    let mut total_weight = 0.0;
+
+    // Helper to get scheduled timestamp
+    // We duplicate the logic from updates.rs effectively here since it's small
+    let get_sched_ts = |secs: u32| -> Option<i64> {
+        use chrono::NaiveDate;
+        if let Ok(date) = NaiveDate::parse_from_str(&date_str, "%Y%m%d") {
+            if let Some(naive_dt) = date.and_hms_opt(0, 0, 0) {
+                if let Some(base_dt) = Los_Angeles.from_local_datetime(&naive_dt).single() {
+                    let sched_dt = base_dt + chrono::Duration::seconds(secs as i64);
+                    return Some(sched_dt.timestamp());
+                }
+            }
+        }
+        None
+    };
+
+    let latest_timestamp = history_slice.last().map(|p| p.timestamp).unwrap_or(0);
+
+    for (idx, ts_opt) in matched_stops.iter().enumerate() {
+        if let Some(actual_ts) = ts_opt {
+            let st = &stop_times[idx];
+            if let Some(sched_secs) = st.arrival_time_secs {
+                if let Some(sched_ts) = get_sched_ts(sched_secs) {
+                    let delta = *actual_ts as i64 - sched_ts;
+
+                    total_delta_sum += delta as f64;
+                    delta_count += 1;
+
+                    // Recency weight
+                    let seconds_ago = if latest_timestamp > *actual_ts {
+                        latest_timestamp - *actual_ts
+                    } else {
+                        0
+                    };
+
+                    let weight = if seconds_ago <= 300 {
+                        1.0
+                    } else if seconds_ago <= 1200 {
+                        1.0 - (0.8 * (seconds_ago - 300) as f64 / 900.0)
+                    } else {
+                        0.2
+                    };
+
+                    // Time Match Score
+                    // Similar logic to previous:
+                    // -5m to +10m: Good
+                    // -10m to +20m: Okay
+                    // -20m to +30m: Poor
+                    let ts_score = if delta >= -300 && delta <= 600 {
+                        1.0
+                    } else if delta >= -600 && delta <= 1200 {
+                        0.7
+                    } else if delta >= -1200 && delta <= 1800 {
+                        0.3
+                    } else {
+                        0.0
+                    };
+
+                    weighted_score_sum += ts_score * weight;
+                    total_weight += weight;
+                }
+            }
+        }
+    }
+
+    // Excessive delay check
     if delta_count > 0 {
-        let avg_delta = total_delta_sum as f64 / delta_count as f64;
+        let avg_delta = total_delta_sum / delta_count as f64;
+        // Strictly penalize trips that are on average > 30 mins late or > 30 mins early
         if avg_delta.abs() > 1800.0 {
             println!(
-                "Trip {} disqualified due to excessive average delay: {}s",
+                "Trip {} disqualified due to excessive average delay: {:.1}s",
                 trip.trip_id, avg_delta
             );
             return (0.0, false);
@@ -616,26 +642,28 @@ fn score_trip_with_segmentation(
     let avg_time_score = if total_weight > 0.0 {
         weighted_time_score_sum / total_weight
     } else {
-        0.5
+        0.0 // No valid time comparisons means we can't verify this trip
     };
 
-    let coverage = unique_stops as f64 / trip.stop_times.len() as f64;
+    let coverage = unique_stops_matched as f64 / stop_times.len() as f64;
 
-    // Check for transition signature
+    // Check for transition signature using existing helper
     let transition_detected = detect_transition_signature(state, trip, gtfs, terminus_visits);
 
     // Consider early stop presence in recent history
-    let has_early_stops = matches
+    // We can check if matched_stops contain early indices
+    let has_early_stops = matched_stops
         .iter()
-        .any(|m| m.stop_idx > 0 && m.stop_idx <= EARLY_STOP_THRESHOLD);
+        .enumerate()
+        .any(|(i, m)| m.is_some() && i <= EARLY_STOP_THRESHOLD);
     let early_bonus = if has_early_stops && segment_start.is_some() {
         1.2
     } else {
         1.0
     };
 
-    let raw_score = (unique_stops as f64).sqrt()
-        * order_score
+    // Calculate final score
+    let raw_score = (unique_stops_matched as f64).sqrt()
         * avg_time_score
         * (0.3 + 0.7 * coverage)
         * early_bonus;

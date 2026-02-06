@@ -117,9 +117,17 @@ fn generate_single_trip_update(
     // Build stop time updates
     let mut stop_time_updates = Vec::new();
 
+    // Count stop occurrences to determine if sequence is needed
+    let mut stop_counts = std::collections::HashMap::new();
+    for st in stop_times {
+        *stop_counts.entry(&st.stop_id).or_insert(0) += 1;
+    }
+
     for (i, st) in stop_times.iter().enumerate() {
         let mut stu = gtfs_realtime::trip_update::StopTimeUpdate::default();
-        stu.stop_sequence = Some(st.sequence);
+        if *stop_counts.get(&st.stop_id).unwrap_or(&0) > 1 {
+            stu.stop_sequence = Some(st.sequence);
+        }
         stu.stop_id = Some(st.stop_id.clone());
 
         if let Some(actual_ts) = matched_stops[i] {

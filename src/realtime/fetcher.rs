@@ -79,7 +79,7 @@ async fn fetch_and_process(
                     let vehicle_id = vehicle
                         .vehicle
                         .as_ref()
-                        .and_then(|v| v.id.clone())
+                        .and_then(|v| v.label.clone())
                         .unwrap_or_else(|| entity.id.clone());
 
                     let state = state_manager.get_or_create(&vehicle_id);
@@ -106,7 +106,7 @@ async fn fetch_and_process(
                 let vehicle_id = vehicle
                     .vehicle
                     .as_ref()
-                    .and_then(|v| v.id.clone())
+                    .and_then(|v| v.label.clone())
                     .unwrap_or_else(|| entity.id.clone());
 
                 if let Some(state) = state_manager.get(&vehicle_id) {
@@ -189,9 +189,16 @@ fn create_enhanced_vehicle(
         modified_trip: None,
     });
 
+    let vehicle = original.vehicle.as_ref().map(|v| gtfs_realtime::VehicleDescriptor {
+        id: v.label.clone(),
+        label: v.label.clone(),
+        license_plate: v.license_plate.clone(),
+        wheelchair_accessible: v.wheelchair_accessible,
+    });
+
     gtfs_realtime::VehiclePosition {
         trip,
-        vehicle: original.vehicle.clone(),
+        vehicle,
         position: original.position.clone(),
         current_stop_sequence: original.current_stop_sequence,
         stop_id: original.stop_id.clone(),

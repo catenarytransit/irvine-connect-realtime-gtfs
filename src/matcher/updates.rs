@@ -51,6 +51,7 @@ fn generate_single_trip_update(
 
     trip_update.vehicle = Some(gtfs_realtime::VehicleDescriptor {
         id: Some(state.vehicle_id.clone()),
+        label: Some(state.vehicle_id.clone()),
         ..Default::default()
     });
 

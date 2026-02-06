@@ -24,7 +24,7 @@ pub async fn load_gtfs() -> Result<GtfsData, Box<dyn std::error::Error + Send + 
     let mut weekday_trips: Vec<usize> = Vec::new();
     let mut weekend_trips: Vec<usize> = Vec::new();
 
-    for (trip_id, service_id, block_id) in trips_raw {
+    for (route_id, trip_id, service_id, block_id) in trips_raw {
         let stop_times = stop_times_map.get(&trip_id).cloned().unwrap_or_default();
 
         let idx = trips.len();
@@ -42,6 +42,7 @@ pub async fn load_gtfs() -> Result<GtfsData, Box<dyn std::error::Error + Send + 
 
         trips.push(Trip {
             trip_id,
+            route_id,
             service_id,
             block_id,
             stop_times,
@@ -86,7 +87,7 @@ fn parse_stops(
 
 fn parse_trips(
     archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
-) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<(String, String, String, String)>, Box<dyn std::error::Error + Send + Sync>> {
     let mut file = archive.by_name("trips.txt")?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
@@ -96,11 +97,12 @@ fn parse_trips(
 
     for result in reader.records() {
         let record = result?;
+        let route_id = record.get(0).unwrap_or("").to_string();
         let service_id = record.get(1).unwrap_or("").to_string();
         let trip_id = record.get(2).unwrap_or("").to_string();
         let block_id = record.get(4).unwrap_or("").to_string();
 
-        trips.push((trip_id, service_id, block_id));
+        trips.push((route_id, trip_id, service_id, block_id));
     }
 
     Ok(trips)

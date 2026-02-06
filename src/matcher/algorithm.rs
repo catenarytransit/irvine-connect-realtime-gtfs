@@ -205,22 +205,42 @@ pub fn perform_global_assignment(
     let mut assigned_trips = std::collections::HashSet::new();
     let mut assigned_vehicles = std::collections::HashSet::new();
     let mut final_assignments = std::collections::HashMap::new();
+    let mut fallback_routes = std::collections::HashMap::new();
 
     for (score, vehicle_id, trip_id, start_date) in all_matches {
-        if score < CONFIDENCE_THRESHOLD {
+        // If we already have a confident assignment for this vehicle, skip
+        if assigned_vehicles.contains(&vehicle_id) {
             continue;
         }
 
-        if !assigned_vehicles.contains(&vehicle_id) && !assigned_trips.contains(&trip_id) {
-            assigned_vehicles.insert(vehicle_id.clone());
-            assigned_trips.insert(trip_id.clone());
-            final_assignments.insert(vehicle_id, (trip_id, start_date, score));
+        if score >= CONFIDENCE_THRESHOLD {
+            if !assigned_trips.contains(&trip_id) {
+                assigned_vehicles.insert(vehicle_id.clone());
+                assigned_trips.insert(trip_id.clone());
+                
+                let route_id = gtfs.get_trip_by_id(&trip_id).map(|t| t.route_id.clone());
+                final_assignments.insert(vehicle_id, (trip_id, route_id, start_date, score));
+            }
+        } else {
+             // Best match is below threshold. Store as fallback route if we haven't seen this vehicle 
+             // in this loop yet (since it's sorted by score, first time is best match).
+             // Since we check assigned_vehicles above allowing continue, and we are in else branch,
+             // we successfully missed the confidence check.
+             // But valid candidates might be multiple. 
+             // We only want the best one for fallback.
+             if !fallback_routes.contains_key(&vehicle_id) {
+                 if let Some(trip) = gtfs.get_trip_by_id(&trip_id) {
+                     fallback_routes.insert(vehicle_id.clone(), trip.route_id.clone());
+                 }
+             }
         }
     }
 
     for vehicle_id in &vehicle_ids {
         if let Some(state) = state_manager.get_mut(&vehicle_id) {
-            if let Some((trip_id, start_date, score)) = final_assignments.get(vehicle_id) {
+            let fallback_route = fallback_routes.get(vehicle_id).cloned();
+
+            if let Some((trip_id, route_id, start_date, score)) = final_assignments.get(vehicle_id) {
                 if state.assigned_trip_id.as_ref() != Some(trip_id) {
                     let is_block_transition =
                         state.assigned_trip_id.as_ref().map_or(false, |current| {
@@ -243,6 +263,7 @@ pub fn perform_global_assignment(
                             .map(|p| p.timestamp)
                             .unwrap_or(0);
                         state.transition_to_new_trip(trip_id, timestamp);
+                        state.route_id = route_id.clone();
                         state.assigned_start_date = Some(start_date.clone());
                         state.trip_confidence = *score;
                     } else {
@@ -251,20 +272,42 @@ pub fn perform_global_assignment(
                             trip_id, vehicle_id, score
                         );
                         state.assigned_trip_id = Some(trip_id.clone());
+                        state.route_id = route_id.clone();
                         state.assigned_start_date = Some(start_date.clone());
                         state.trip_confidence = *score;
                     }
                 } else {
                     state.trip_confidence = *score;
+                    // Ensure route_id is set if it was missing
+                    if state.route_id.is_none() {
+                         state.route_id = route_id.clone();
+                    }
                 }
-            } else if state.assigned_trip_id.is_some() {
-                println!(
-                    "Vehicle {} lost its assignment (no valid match found or trip taken)",
-                    vehicle_id
-                );
-                state.assigned_trip_id = None;
-                state.assigned_start_date = None;
-                state.trip_confidence = 0.0;
+            } else {
+                // No confident assignment found
+                if state.assigned_trip_id.is_some() {
+                    println!(
+                        "Vehicle {} lost its assignment (no valid match found or trip taken)",
+                        vehicle_id
+                    );
+                    state.assigned_trip_id = None;
+                    state.assigned_start_date = None;
+                    state.trip_confidence = 0.0;
+                    
+                    // Fallback to route if available
+                    state.route_id = fallback_route;
+                    if let Some(r) = &state.route_id {
+                        println!("Vehicle {} fallback to route {}", vehicle_id, r);
+                    }
+                } else {
+                    // Just update route if we have a guess
+                    if let Some(r) = fallback_route {
+                        if state.route_id.as_ref() != Some(&r) {
+                             state.route_id = Some(r.clone());
+                             println!("Vehicle {} assigned fallback route {}", vehicle_id, r);
+                        }
+                    }
+                }
             }
         }
     }

@@ -19,6 +19,7 @@ pub struct StopTime {
 #[derive(Debug, Clone)]
 pub struct Trip {
     pub trip_id: String,
+    pub route_id: String,
     pub service_id: String,
     pub block_id: String,
     pub stop_times: Vec<StopTime>,

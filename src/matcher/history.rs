@@ -21,6 +21,7 @@ pub struct VehicleState {
     pub visited_stops: Vec<String>,
     pub stop_visit_timestamps: Vec<(String, u64)>,
     pub assigned_trip_id: Option<String>,
+    pub route_id: Option<String>,
     pub assigned_start_date: Option<String>,
     pub trip_confidence: f64,
     pub last_stop_visit_time: u64,
@@ -38,6 +39,7 @@ impl VehicleState {
             visited_stops: Vec::new(),
             stop_visit_timestamps: Vec::new(),
             assigned_trip_id: None,
+            route_id: None,
             assigned_start_date: None,
             trip_confidence: 0.0,
             last_stop_visit_time: 0,
@@ -88,6 +90,7 @@ impl VehicleState {
         self.stop_visit_timestamps.clear();
         self.assigned_trip_id = None;
         self.assigned_start_date = None;
+        self.route_id = None;
         self.trip_confidence = 0.0;
     }
 
@@ -99,6 +102,9 @@ impl VehicleState {
         self.last_terminus_departure = Some(departure_timestamp);
         self.visited_stops.clear();
         self.stop_visit_timestamps.clear();
+        // route_id will be updated by the next assignment loop if needed, 
+        // but ideally we should set it here if we knew it. 
+        // For now, the global assignment loop will handle setting route_id.
     }
 
     /// Clear position history entirely (use when transitioning between blocks or long gaps)

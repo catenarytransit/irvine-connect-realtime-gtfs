@@ -78,7 +78,7 @@ async fn fetch_and_process(
                 if let Some(position) = &vehicle.position {
                     let vehicle_ref = vehicle.vehicle.as_ref();
                     let label = vehicle_ref.and_then(|v| v.label.clone());
-                    let source_id = vehicle_ref.and_then(|v| v.id.clone());
+                    let source_id = vehicle_ref.and_then(|v| v.label.clone());
 
                     let vehicle_id = label.clone().unwrap_or_else(|| entity.id.clone());
 
@@ -159,20 +159,6 @@ async fn fetch_and_process(
     // Generate Trip Updates
     {
         let state_manager = states.read().await;
-        // Access GtfsData inner Gtfs struct. Assuming GtfsData implements Deref or has a field.
-        // Actually GtfsData usually is the struct, let's assume it behaves like GTFS or we need access.
-        // Checking Main.rs, GtfsData comes from gtfs::loader::load_gtfs().
-        // Let's assume GtfsData IS the struct from gtfs-structures or wraps it.
-        // In fetcher.rs imports: `use crate::gtfs::GtfsData;`.
-        // In matcher/updates.rs: `fn generate_trip_updates(gtfs: &Gtfs, ...)`
-        // We need to pass the underlying Gtfs object.
-        // If GtfsData is a type alias for Gtfs, we are good. If it's a wrapper, we need to extract.
-        // I need to check `src/gtfs/mod.rs` or `src/gtfs/loader.rs` to be sure.
-        // But for now, let's try passing `&gtfs` assuming it works or `&gtfs.inner` if I knew.
-        // Wait, I should verify what GtfsData is. but I will guess it derefs or is the struct.
-
-        // Actually earlier `list_dir` showed `gtfs` folder has `loader.rs`.
-        // I will assume `GtfsData` is `gtfs_structures::Gtfs`.
 
         let updates_msg = updates::generate_trip_updates(&gtfs, &state_manager);
         let mut updates_lock = trip_updates_feed.write().await;

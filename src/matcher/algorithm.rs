@@ -535,7 +535,18 @@ fn score_trip_with_segmentation(
     let order_score = longest_increasing as f64 / unique_stops as f64;
 
     // Time score: how well do position timestamps match scheduled times?
-    let mut time_scores: Vec<f64> = Vec::new();
+    let mut weighted_time_score_sum = 0.0;
+    let mut total_weight = 0.0;
+    let mut total_delta_sum = 0;
+    let mut delta_count = 0;
+
+    // Find the latest timestamp in the matches to use as a reference for recency
+    let latest_timestamp = matches
+        .iter()
+        .map(|m| m.position_timestamp)
+        .max()
+        .unwrap_or(0);
+
     for m in &matches {
         if let Some(scheduled_secs) = m.scheduled_secs {
             let pos_la = Los_Angeles
@@ -546,6 +557,27 @@ fn score_trip_with_segmentation(
                     (pos_time.hour() * 3600 + pos_time.minute() * 60 + pos_time.second()) as i32;
                 let scheduled = scheduled_secs as i32;
                 let delta = observed_secs - scheduled;
+
+                // Accumulate total delta for average calculation
+                total_delta_sum += delta;
+                delta_count += 1;
+
+                // Calculate weight based on recency
+                // Maps 0-300s (5 mins) ago to 1.0, then linearly decays to 0.2 at 20 mins ago
+                let seconds_ago = if latest_timestamp > m.position_timestamp {
+                    latest_timestamp - m.position_timestamp
+                } else {
+                    0
+                };
+
+                let weight = if seconds_ago <= 300 {
+                    1.0
+                } else if seconds_ago <= 1200 {
+                    // Decay from 1.0 to 0.2
+                    1.0 - (0.8 * (seconds_ago - 300) as f64 / 900.0)
+                } else {
+                    0.2
+                };
 
                 // typically vehicles run more late than early but a few min early is also acceptable to them
                 // Adjusted to be more symmetrical relative to zero, but biased towards lateness
@@ -561,15 +593,30 @@ fn score_trip_with_segmentation(
                 } else {
                     0.0
                 };
-                time_scores.push(ts);
+
+                weighted_time_score_sum += ts * weight;
+                total_weight += weight;
             }
         }
     }
 
-    let avg_time_score = if time_scores.is_empty() {
-        0.5
+    // Strict cutoff: if average delay is > 30 minutes (1800s) or < -30 minutes, force score to 0
+    // This prevents matching trips that are spatially correct but wildly off in time (e.g. 2 hours late)
+    if delta_count > 0 {
+        let avg_delta = total_delta_sum as f64 / delta_count as f64;
+        if avg_delta.abs() > 1800.0 {
+            println!(
+                "Trip {} disqualified due to excessive average delay: {}s",
+                trip.trip_id, avg_delta
+            );
+            return (0.0, false);
+        }
+    }
+
+    let avg_time_score = if total_weight > 0.0 {
+        weighted_time_score_sum / total_weight
     } else {
-        time_scores.iter().sum::<f64>() / time_scores.len() as f64
+        0.5
     };
 
     let coverage = unique_stops as f64 / trip.stop_times.len() as f64;

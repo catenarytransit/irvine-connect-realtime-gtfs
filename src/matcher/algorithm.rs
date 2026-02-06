@@ -640,7 +640,7 @@ fn score_trip_with_segmentation(
     }
 
     let avg_time_score = if total_weight > 0.0 {
-        weighted_time_score_sum / total_weight
+        weighted_score_sum / total_weight
     } else {
         0.0 // No valid time comparisons means we can't verify this trip
     };

@@ -39,7 +39,7 @@ pub fn update_vehicle_state(
     lon: f64,
     bearing: Option<f32>,
     timestamp: u64,
-    _gtfs: &GtfsData,
+    gtfs: &GtfsData,
 ) {
     state.add_position(lat, lon, bearing, timestamp);
 }

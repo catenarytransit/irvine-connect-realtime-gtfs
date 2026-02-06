@@ -66,27 +66,67 @@ fn generate_single_trip_update(
     });
 
     // Build a map of stop_id -> (visit_index, actual_timestamp) from the vehicle's history
-    let mut stop_visits: std::collections::HashMap<&str, (usize, u64)> =
-        std::collections::HashMap::new();
-    for (i, (stop_id, ts)) in state.stop_visit_timestamps.iter().enumerate() {
-        stop_visits.insert(stop_id.as_str(), (i, *ts));
-    }
+    // We use a greedy monotonic matcher on the position history
+    use crate::matcher::proximity::haversine_distance;
 
-    // Match visited stops to stop_times in sequence order
-    // For each stop in the trip, check if it was visited
     let mut matched_stops: Vec<Option<u64>> = vec![None; stop_times.len()];
-    let mut last_visit_idx: Option<usize> = None;
+    let mut last_matched_sequence_idx = 0;
 
-    for (st_idx, st) in stop_times.iter().enumerate() {
-        if let Some(&(visit_idx, actual_ts)) = stop_visits.get(st.stop_id.as_str()) {
-            // Only match if this visit comes after previous matched visits (sequence order)
-            let is_valid = match last_visit_idx {
-                Some(prev_idx) => visit_idx > prev_idx,
-                None => true,
-            };
-            if is_valid {
-                matched_stops[st_idx] = Some(actual_ts);
-                last_visit_idx = Some(visit_idx);
+    // We iterate through all history positions
+    let trip_stop_ids: Vec<String> = stop_times.iter().map(|st| st.stop_id.clone()).collect();
+
+    for pos in &state.position_history {
+        // We only check stops that are at or ahead of our last matched index
+        // To handle lollipops correctly, we must enforce sequence order.
+        // We look ahead a few stops (e.g. 5) to allow for missing a stop, but not jumping too far?
+        // Actually, strictly monotonic with a small lookahead is safer.
+        // But for a lollipop, the physical location of stop N and stop N+K might be same.
+        // If we are at index N, and we see location matches N and N+K.
+        // If we are definitely at N (based on history), we match N.
+        // If we move away and return, we match N+K.
+
+        let mut best_match: Option<(usize, u64)> = None;
+        let mut best_dist = 100.0; // Max radius to consider
+
+        // Check upcoming stops (e.g. next 10 stops to allow for some skipped stops)
+        let search_end = (last_matched_sequence_idx + 10).min(stop_times.len());
+
+        for idx in last_matched_sequence_idx..search_end {
+            let st = &stop_times[idx];
+            if let Some(stop) = gtfs.stops.get(&st.stop_id) {
+                let dist = haversine_distance(pos.lat, pos.lon, stop.lat, stop.lon);
+                if dist < best_dist {
+                    best_match = Some((idx, pos.timestamp));
+                    best_dist = dist;
+                }
+            }
+        }
+
+        if let Some((idx, ts)) = best_match {
+            matched_stops[idx] = Some(ts);
+            // If we advanced sequence, update last_matched
+            // But we might linger at a stop, so we don't force increment immediately unless we clearly moved?
+            // Actually, if we match idx > last_matched, we should probably advance.
+            // But if we match idx == last_matched, we just update the timestamp (latest visit).
+            // Wait, we want the ARRIVAL time usually, which is the FIRST hit.
+            // But for real-time updates, "arrival" is when we got there.
+            // Let's keep the FIRST timestamp we matched for a sequence as the arrival.
+
+            if idx >= last_matched_sequence_idx {
+                last_matched_sequence_idx = idx;
+                // If we haven't recorded a time for this stop yet, use this one (earliest detection)
+                if matched_stops[idx].is_none() {
+                    matched_stops[idx] = Some(ts);
+                }
+                // If we accept multiple hits, we might want to know dwell time?
+                // For now, let's stick to "first detection" as arrival.
+                // Actually, if we are recalculating from history, "first detection" in history order IS arrival.
+
+                // However, the `matched_stops[idx] = Some(ts)` above overwrites.
+                // We want the *first* time we hit it in the history.
+                if matched_stops[idx].map_or(true, |existing| ts < existing) {
+                    matched_stops[idx] = Some(ts);
+                }
             }
         }
     }

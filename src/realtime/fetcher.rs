@@ -83,7 +83,7 @@ async fn fetch_and_process(
                     let vehicle_id = label.clone().unwrap_or_else(|| entity.id.clone());
 
                     let state = state_manager.get_or_create(&vehicle_id);
-                    
+
                     // Update static info
                     if state.label.is_none() && label.is_some() {
                         state.label = label;
@@ -197,12 +197,15 @@ fn create_enhanced_vehicle(
         modified_trip: None,
     });
 
-    let vehicle = original.vehicle.as_ref().map(|v| gtfs_realtime::VehicleDescriptor {
-        id: v.label.clone(),
-        label: v.label.clone(),
-        license_plate: v.license_plate.clone(),
-        wheelchair_accessible: v.wheelchair_accessible,
-    });
+    let vehicle = original
+        .vehicle
+        .as_ref()
+        .map(|v| gtfs_realtime::VehicleDescriptor {
+            id: v.label.clone(),
+            label: v.label.clone(),
+            license_plate: v.license_plate.clone(),
+            wheelchair_accessible: v.wheelchair_accessible,
+        });
 
     gtfs_realtime::VehiclePosition {
         trip,

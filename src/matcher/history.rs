@@ -162,4 +162,11 @@ impl VehicleStateManager {
     pub fn all_states(&self) -> impl Iterator<Item = &VehicleState> {
         self.states.values()
     }
+
+    #[cfg(test)]
+    pub fn mock_with_state(state: VehicleState) -> Self {
+        let mut states = HashMap::new();
+        states.insert(state.vehicle_id.clone(), state);
+        Self { states }
+    }
 }

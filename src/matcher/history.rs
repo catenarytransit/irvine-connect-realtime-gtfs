@@ -3,8 +3,10 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 
-const HISTORY_DURATION_SECS: u64 = 20 * 60;
-const MAX_POSITION_HISTORY: usize = 1200;
+// time cutoff, items older than this will be dropped
+const HISTORY_DURATION_SECS: u64 = 60 * 60;
+//Memory count, items greater than this size will be dropped
+const MAX_POSITION_HISTORY: usize = 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimestampedPosition {

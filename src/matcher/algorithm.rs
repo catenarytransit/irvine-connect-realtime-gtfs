@@ -17,7 +17,9 @@ const LATE_STOP_THRESHOLD: usize = 70;
 const EARLY_STOP_THRESHOLD: usize = 15;
 
 const TRANSITION_BONUS: f64 = 1.5;
-const PREVIOUS_TRIP_PENALTY: f64 = 0.3;
+const PREVIOUS_TRIP_PENALTY: f64 = 0.8;
+
+
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TerminusVisitType {
@@ -172,7 +174,6 @@ pub fn perform_global_assignment(
                                     "Vehicle {} - Penalizing {} (history shows next trip {})",
                                     vehicle_id, trip.trip_id, next_in_block.trip_id
                                 );
-                                final_score *= PREVIOUS_TRIP_PENALTY;
                             }
                         }
 
@@ -547,11 +548,16 @@ fn score_trip_with_segmentation(
                 let scheduled = scheduled_secs as i32;
                 let delta = observed_secs - scheduled;
 
-                let ts = if delta.abs() <= 120 {
+                // typically vehicles run more late than early but a few min early is also acceptable to them
+                // Adjusted to be more symmetrical relative to zero, but biased towards lateness
+                let ts = if delta >= -300 && delta <= 600 {
+                    // Up to 5 mins early, or 10 mins late
                     1.0
-                } else if delta.abs() <= 600 {
+                } else if delta >= -600 && delta <= 1200 {
+                    // Up to 10 mins early, or 20 mins late
                     0.7
-                } else if delta.abs() <= 1200 {
+                } else if delta >= -1200 && delta <= 1800 {
+                    // Up to 20 mins early, or 30 mins late
                     0.3
                 } else {
                     0.0

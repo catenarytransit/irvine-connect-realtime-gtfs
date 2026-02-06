@@ -50,8 +50,18 @@ fn generate_single_trip_update(
     trip_update.trip = trip_descriptor;
 
     trip_update.vehicle = Some(gtfs_realtime::VehicleDescriptor {
-        id: Some(state.vehicle_id.clone()),
-        label: Some(state.vehicle_id.clone()),
+        id: Some(
+            state
+                .source_id
+                .clone()
+                .unwrap_or_else(|| state.vehicle_id.clone()),
+        ),
+        label: Some(
+            state
+                .label
+                .clone()
+                .unwrap_or_else(|| state.vehicle_id.clone()),
+        ),
         ..Default::default()
     });
 
@@ -95,6 +105,7 @@ fn generate_single_trip_update(
     if let Some(idx) = last_visited_idx {
         if let Some(actual_ts) = matched_stops[idx] {
             let st = &stop_times[idx];
+            // Calculate delay based on arrival time
             if let Some(sched_secs) = st.arrival_time_secs {
                 if let Ok(sched_ts) = get_scheduled_timestamp(date_str, sched_secs) {
                     propagated_delay = (actual_ts as i64 - sched_ts as i64) as i32;
@@ -112,24 +123,43 @@ fn generate_single_trip_update(
         stu.stop_id = Some(st.stop_id.clone());
 
         if let Some(actual_ts) = matched_stops[i] {
-            // Past stop: use actual arrival time
+            // Past stop: use actual arrival time.
+            // We can assume departure is same as arrival for past stops if we don't have dwell info,
+            // or use specific departure logic if available. For now, use actual_ts for both.
             let mut event = gtfs_realtime::trip_update::StopTimeEvent::default();
             event.time = Some(actual_ts as i64);
+            // event.delay = Some(0); // Omit delay
+
             stu.arrival = Some(event.clone());
             stu.departure = Some(event);
         } else {
-            // Future stop: propagate delay from last visited stop
-            let mut event = gtfs_realtime::trip_update::StopTimeEvent::default();
-            event.delay = Some(propagated_delay);
+            // Future stop: propagate delay
+            // Arrival
+            let mut arrival_event = gtfs_realtime::trip_update::StopTimeEvent::default();
+            // arrival_event.delay = Some(propagated_delay); // Omit delay
 
             if let Some(sched_secs) = st.arrival_time_secs {
                 if let Ok(sched_ts) = get_scheduled_timestamp(date_str, sched_secs) {
-                    event.time = Some(sched_ts as i64 + propagated_delay as i64);
+                    arrival_event.time = Some(sched_ts as i64 + propagated_delay as i64);
                 }
             }
+            stu.arrival = Some(arrival_event);
 
-            stu.arrival = Some(event.clone());
-            stu.departure = Some(event);
+            // Departure
+            let mut departure_event = gtfs_realtime::trip_update::StopTimeEvent::default();
+            // departure_event.delay = Some(propagated_delay); // Omit delay
+
+            if let Some(sched_secs) = st.departure_time_secs {
+                if let Ok(sched_ts) = get_scheduled_timestamp(date_str, sched_secs) {
+                    departure_event.time = Some(sched_ts as i64 + propagated_delay as i64);
+                }
+            } else if let Some(sched_secs) = st.arrival_time_secs {
+                // Fallback to arrival time if departure is missing (unlikely given update)
+                if let Ok(sched_ts) = get_scheduled_timestamp(date_str, sched_secs) {
+                    departure_event.time = Some(sched_ts as i64 + propagated_delay as i64);
+                }
+            }
+            stu.departure = Some(departure_event);
         }
 
         stu.schedule_relationship = Some(

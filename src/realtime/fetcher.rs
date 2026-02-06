@@ -76,13 +76,21 @@ async fn fetch_and_process(
         for entity in &feed.entity {
             if let Some(vehicle) = &entity.vehicle {
                 if let Some(position) = &vehicle.position {
-                    let vehicle_id = vehicle
-                        .vehicle
-                        .as_ref()
-                        .and_then(|v| v.label.clone())
-                        .unwrap_or_else(|| entity.id.clone());
+                    let vehicle_ref = vehicle.vehicle.as_ref();
+                    let label = vehicle_ref.and_then(|v| v.label.clone());
+                    let source_id = vehicle_ref.and_then(|v| v.id.clone());
+
+                    let vehicle_id = label.clone().unwrap_or_else(|| entity.id.clone());
 
                     let state = state_manager.get_or_create(&vehicle_id);
+                    
+                    // Update static info
+                    if state.label.is_none() && label.is_some() {
+                        state.label = label;
+                    }
+                    if state.source_id.is_none() && source_id.is_some() {
+                        state.source_id = source_id;
+                    }
 
                     algorithm::update_vehicle_state(
                         state,

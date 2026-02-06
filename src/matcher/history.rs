@@ -17,6 +17,8 @@ pub struct TimestampedPosition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VehicleState {
     pub vehicle_id: String,
+    pub label: Option<String>,
+    pub source_id: Option<String>,
     pub position_history: VecDeque<TimestampedPosition>,
     pub visited_stops: Vec<String>,
     pub stop_visit_timestamps: Vec<(String, u64)>,
@@ -35,6 +37,8 @@ impl VehicleState {
     pub fn new(vehicle_id: String) -> Self {
         Self {
             vehicle_id,
+            label: None,
+            source_id: None,
             position_history: VecDeque::with_capacity(MAX_POSITION_HISTORY),
             visited_stops: Vec::new(),
             stop_visit_timestamps: Vec::new(),

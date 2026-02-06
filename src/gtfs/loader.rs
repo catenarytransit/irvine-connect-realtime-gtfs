@@ -127,11 +127,16 @@ fn parse_stop_times(
 
         let arrival_time_secs = parse_time_to_secs(&arrival_time);
 
+        let departure_time = record.get(2).unwrap_or("").to_string();
+        let departure_time_secs = parse_time_to_secs(&departure_time);
+
         stop_times.entry(trip_id).or_default().push(StopTime {
             stop_id,
             sequence,
             arrival_time,
             arrival_time_secs,
+            departure_time,
+            departure_time_secs,
         });
     }
 

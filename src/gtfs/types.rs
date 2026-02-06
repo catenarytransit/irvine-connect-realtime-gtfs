@@ -14,6 +14,8 @@ pub struct StopTime {
     pub sequence: u32,
     pub arrival_time: String,
     pub arrival_time_secs: Option<u32>,
+    pub departure_time: String,
+    pub departure_time_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

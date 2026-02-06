@@ -5,7 +5,7 @@ use chrono::{Datelike, TimeZone, Timelike};
 use chrono_tz::America::Los_Angeles;
 
 const MIN_POSITIONS_FOR_MATCHING: usize = 5;
-const CONFIDENCE_THRESHOLD: f64 = 0.10;
+const CONFIDENCE_THRESHOLD: f64 = 0.05;
 const TIME_WINDOW_MINUTES: i32 = 90;
 
 const TERMINUS_STOP_ID: &str = "157583";

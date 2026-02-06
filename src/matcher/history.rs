@@ -102,8 +102,8 @@ impl VehicleState {
         self.last_terminus_departure = Some(departure_timestamp);
         self.visited_stops.clear();
         self.stop_visit_timestamps.clear();
-        // route_id will be updated by the next assignment loop if needed, 
-        // but ideally we should set it here if we knew it. 
+        // route_id will be updated by the next assignment loop if needed,
+        // but ideally we should set it here if we knew it.
         // For now, the global assignment loop will handle setting route_id.
     }
 

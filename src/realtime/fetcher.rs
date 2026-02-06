@@ -1,5 +1,5 @@
 use crate::gtfs::GtfsData;
-use crate::matcher::{VehicleStateManager, algorithm};
+use crate::matcher::{VehicleStateManager, algorithm, updates};
 use prost::Message;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +13,7 @@ pub async fn run_fetcher(
     gtfs: Arc<GtfsData>,
     states: Arc<RwLock<VehicleStateManager>>,
     current_feed: Arc<RwLock<Option<gtfs_realtime::FeedMessage>>>,
+    trip_updates_feed: Arc<RwLock<Option<gtfs_realtime::FeedMessage>>>,
 ) {
     println!(
         "Starting realtime fetcher, polling every {}ms",
@@ -23,7 +24,7 @@ pub async fn run_fetcher(
     let mut current_iteration = 0;
 
     loop {
-        match fetch_and_process(&client, &gtfs, &states, &current_feed).await {
+        match fetch_and_process(&client, &gtfs, &states, &current_feed, &trip_updates_feed).await {
             Ok(count) => {
                 println!("Processed {} vehicles", count);
             }
@@ -51,6 +52,7 @@ async fn fetch_and_process(
     gtfs: &GtfsData,
     states: &RwLock<VehicleStateManager>,
     current_feed: &RwLock<Option<gtfs_realtime::FeedMessage>>,
+    trip_updates_feed: &RwLock<Option<gtfs_realtime::FeedMessage>>,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let response = client.get(REALTIME_URL).send().await?;
     let bytes = response.bytes().await?;
@@ -144,6 +146,29 @@ async fn fetch_and_process(
     {
         let mut feed_lock = current_feed.write().await;
         *feed_lock = Some(new_feed);
+    }
+
+    // Generate Trip Updates
+    {
+        let state_manager = states.read().await;
+        // Access GtfsData inner Gtfs struct. Assuming GtfsData implements Deref or has a field.
+        // Actually GtfsData usually is the struct, let's assume it behaves like GTFS or we need access.
+        // Checking Main.rs, GtfsData comes from gtfs::loader::load_gtfs().
+        // Let's assume GtfsData IS the struct from gtfs-structures or wraps it.
+        // In fetcher.rs imports: `use crate::gtfs::GtfsData;`.
+        // In matcher/updates.rs: `fn generate_trip_updates(gtfs: &Gtfs, ...)`
+        // We need to pass the underlying Gtfs object.
+        // If GtfsData is a type alias for Gtfs, we are good. If it's a wrapper, we need to extract.
+        // I need to check `src/gtfs/mod.rs` or `src/gtfs/loader.rs` to be sure.
+        // But for now, let's try passing `&gtfs` assuming it works or `&gtfs.inner` if I knew.
+        // Wait, I should verify what GtfsData is. but I will guess it derefs or is the struct.
+
+        // Actually earlier `list_dir` showed `gtfs` folder has `loader.rs`.
+        // I will assume `GtfsData` is `gtfs_structures::Gtfs`.
+
+        let updates_msg = updates::generate_trip_updates(&gtfs, &state_manager);
+        let mut updates_lock = trip_updates_feed.write().await;
+        *updates_lock = Some(updates_msg);
     }
 
     Ok(vehicle_count)

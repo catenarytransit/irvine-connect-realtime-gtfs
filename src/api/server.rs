@@ -8,13 +8,24 @@ use prost::Message;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-pub async fn run_server(current_feed: Arc<RwLock<Option<gtfs_realtime::FeedMessage>>>, port: u16) {
+pub async fn run_server(
+    current_feed: Arc<RwLock<Option<gtfs_realtime::FeedMessage>>>,
+    trip_updates_feed: Arc<RwLock<Option<gtfs_realtime::FeedMessage>>>,
+    port: u16,
+) {
     let app = Router::new()
         .route(
             "/gtfs-rt/vehicle-positions",
             get({
                 let feed = current_feed.clone();
-                move || get_vehicle_positions(feed.clone())
+                move || get_feed(feed.clone())
+            }),
+        )
+        .route(
+            "/gtfs-rt/trip-updates",
+            get({
+                let feed = trip_updates_feed.clone();
+                move || get_feed(feed.clone())
             }),
         )
         .route("/health", get(health_check));
@@ -26,9 +37,7 @@ pub async fn run_server(current_feed: Arc<RwLock<Option<gtfs_realtime::FeedMessa
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn get_vehicle_positions(
-    feed: Arc<RwLock<Option<gtfs_realtime::FeedMessage>>>,
-) -> impl IntoResponse {
+async fn get_feed(feed: Arc<RwLock<Option<gtfs_realtime::FeedMessage>>>) -> impl IntoResponse {
     let feed_lock = feed.read().await;
 
     match &*feed_lock {

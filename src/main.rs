@@ -48,19 +48,23 @@ async fn main() {
         }
     };
     let current_feed = Arc::new(RwLock::new(None::<gtfs_realtime::FeedMessage>));
+    let trip_updates_feed = Arc::new(RwLock::new(None::<gtfs_realtime::FeedMessage>));
 
     let fetcher_gtfs = gtfs_data.clone();
     let fetcher_states = vehicle_states.clone();
     let fetcher_feed = current_feed.clone();
+    let fetcher_tu_feed = trip_updates_feed.clone();
 
     let fetcher_handle = tokio::spawn(async move {
-        realtime::fetcher::run_fetcher(fetcher_gtfs, fetcher_states, fetcher_feed).await;
+        realtime::fetcher::run_fetcher(fetcher_gtfs, fetcher_states, fetcher_feed, fetcher_tu_feed)
+            .await;
     });
 
     let api_feed = current_feed.clone();
+    let api_tu_feed = trip_updates_feed.clone();
     let port = args.port;
     let api_handle = tokio::spawn(async move {
-        api::server::run_server(api_feed, port).await;
+        api::server::run_server(api_feed, api_tu_feed, port).await;
     });
 
     tokio::select! {

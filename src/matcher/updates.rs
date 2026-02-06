@@ -128,7 +128,14 @@ fn generate_single_trip_update(
             // or use specific departure logic if available. For now, use actual_ts for both.
             let mut event = gtfs_realtime::trip_update::StopTimeEvent::default();
             event.time = Some(actual_ts as i64);
-            // event.delay = Some(0); // Omit delay
+
+            // Calculate delay for past stops
+            if let Some(sched_secs) = st.arrival_time_secs {
+                if let Ok(sched_ts) = get_scheduled_timestamp(date_str, sched_secs) {
+                    let delay = (actual_ts as i64 - sched_ts as i64) as i32;
+                    event.delay = Some(delay);
+                }
+            }
 
             stu.arrival = Some(event.clone());
             stu.departure = Some(event);
@@ -136,7 +143,7 @@ fn generate_single_trip_update(
             // Future stop: propagate delay
             // Arrival
             let mut arrival_event = gtfs_realtime::trip_update::StopTimeEvent::default();
-            // arrival_event.delay = Some(propagated_delay); // Omit delay
+            arrival_event.delay = Some(propagated_delay);
 
             if let Some(sched_secs) = st.arrival_time_secs {
                 if let Ok(sched_ts) = get_scheduled_timestamp(date_str, sched_secs) {
@@ -147,7 +154,7 @@ fn generate_single_trip_update(
 
             // Departure
             let mut departure_event = gtfs_realtime::trip_update::StopTimeEvent::default();
-            // departure_event.delay = Some(propagated_delay); // Omit delay
+            departure_event.delay = Some(propagated_delay);
 
             if let Some(sched_secs) = st.departure_time_secs {
                 if let Ok(sched_ts) = get_scheduled_timestamp(date_str, sched_secs) {

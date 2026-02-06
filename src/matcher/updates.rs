@@ -1,6 +1,5 @@
 use crate::gtfs::GtfsData;
 use crate::matcher::history::VehicleStateManager;
-use crate::matcher::proximity::haversine_distance;
 use gtfs_realtime::FeedMessage;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,105 +36,73 @@ fn generate_single_trip_update(
     gtfs: &GtfsData,
     state: &crate::matcher::history::VehicleState,
     trip_id: &str,
-    current_time: u64,
+    _current_time: u64,
 ) -> Option<gtfs_realtime::TripUpdate> {
     let trip = gtfs.get_trip_by_id(trip_id)?;
     let stop_times = &trip.stop_times;
+    let date_str = state.assigned_start_date.as_ref()?;
 
     let mut trip_update = gtfs_realtime::TripUpdate::default();
     let mut trip_descriptor = gtfs_realtime::TripDescriptor::default();
     trip_descriptor.trip_id = Some(trip_id.to_string());
     trip_descriptor.route_id = Some(trip.route_id.clone());
-
-    if let Some(start_date) = &state.assigned_start_date {
-        trip_descriptor.start_date = Some(start_date.clone());
-    }
-
+    trip_descriptor.start_date = Some(date_str.clone());
     trip_update.trip = trip_descriptor;
+
     trip_update.vehicle = Some(gtfs_realtime::VehicleDescriptor {
         id: Some(state.vehicle_id.clone()),
         ..Default::default()
     });
 
-    // --- ALIGNMENT & DELAY CALCULATION ---
+    // Build a map of stop_id -> (visit_index, actual_timestamp) from the vehicle's history
+    let mut stop_visits: std::collections::HashMap<&str, (usize, u64)> =
+        std::collections::HashMap::new();
+    for (i, (stop_id, ts)) in state.stop_visit_timestamps.iter().enumerate() {
+        stop_visits.insert(stop_id.as_str(), (i, *ts));
+    }
 
-    // 1. Identify which stops have been visited.
-    // matched_visits[i] = index in visited_stops that matches stop_times[i], or None
-    let mut matched_visits: Vec<Option<usize>> = vec![None; stop_times.len()];
-    let mut visit_cursor = 0;
+    // Match visited stops to stop_times in sequence order
+    // For each stop in the trip, check if it was visited
+    let mut matched_stops: Vec<Option<u64>> = vec![None; stop_times.len()];
+    let mut last_visit_idx: Option<usize> = None;
 
-    // Greedy matching
     for (st_idx, st) in stop_times.iter().enumerate() {
-        for v_idx in visit_cursor..state.visited_stops.len() {
-            if state.visited_stops[v_idx] == st.stop_id {
-                matched_visits[st_idx] = Some(v_idx);
-                visit_cursor = v_idx + 1;
-                break;
+        if let Some(&(visit_idx, actual_ts)) = stop_visits.get(st.stop_id.as_str()) {
+            // Only match if this visit comes after previous matched visits (sequence order)
+            let is_valid = match last_visit_idx {
+                Some(prev_idx) => visit_idx > prev_idx,
+                None => true,
+            };
+            if is_valid {
+                matched_stops[st_idx] = Some(actual_ts);
+                last_visit_idx = Some(visit_idx);
             }
         }
     }
 
-    // 2. Calculate Current Delay
-    let mut estimated_delay = 0i32;
+    // Find the last visited stop and calculate its delay
+    let mut last_visited_idx: Option<usize> = None;
+    let mut propagated_delay: i32 = 0;
 
-    // Find the index of the last visited stop in stop_times
-    let last_visited_idx = matched_visits.iter().rposition(|v| v.is_some());
-
-    if let Some(last_idx) = last_visited_idx {
-        // We have visited at least one stop.
-        // Check if we can interpolate to the NEXT stop (last_idx + 1)
-        if last_idx + 1 < stop_times.len() {
-            let prev_st = &stop_times[last_idx];
-            let next_st = &stop_times[last_idx + 1];
-
-            if let Some(pos) = state.position_history.back() {
-                estimated_delay = calculate_interpolated_delay(
-                    gtfs,
-                    state,
-                    prev_st,
-                    next_st,
-                    pos.lat,
-                    pos.lon,
-                    current_time,
-                )
-                .unwrap_or(0) as i32;
-
-                // Fallback: if interpolation fails (e.g. 0), use delay at last stop
-                if estimated_delay == 0 {
-                    if let Some(v_idx) = matched_visits[last_idx] {
-                        if let Some((_, visit_ts)) = state.stop_visit_timestamps.get(v_idx) {
-                            if let Some(date_str) = &state.assigned_start_date {
-                                if let Some(sched_secs) = prev_st.arrival_time_secs {
-                                    if let Ok(sched_ts) =
-                                        get_scheduled_timestamp(date_str, sched_secs)
-                                    {
-                                        estimated_delay =
-                                            (*visit_ts as i64 - sched_ts as i64) as i32;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    for (i, matched_ts) in matched_stops.iter().enumerate().rev() {
+        if matched_ts.is_some() {
+            last_visited_idx = Some(i);
+            break;
         }
-    } else {
-        // No stops visited yet.
-        if let Some(first_st) = stop_times.first() {
-            if let Some(date_str) = &state.assigned_start_date {
-                if let Some(sched_secs) = first_st.arrival_time_secs {
-                    if let Ok(sched_ts) = get_scheduled_timestamp(date_str, sched_secs) {
-                        if current_time > sched_ts + 60 {
-                            estimated_delay = (current_time as i64 - sched_ts as i64) as i32;
-                        }
-                    }
+    }
+
+    if let Some(idx) = last_visited_idx {
+        if let Some(actual_ts) = matched_stops[idx] {
+            let st = &stop_times[idx];
+            if let Some(sched_secs) = st.arrival_time_secs {
+                if let Ok(sched_ts) = get_scheduled_timestamp(date_str, sched_secs) {
+                    propagated_delay = (actual_ts as i64 - sched_ts as i64) as i32;
                 }
             }
         }
     }
 
-    // --- CONSTRUCT UPDATES ---
-
+    // Build stop time updates
     let mut stop_time_updates = Vec::new();
 
     for (i, st) in stop_times.iter().enumerate() {
@@ -143,82 +110,35 @@ fn generate_single_trip_update(
         stu.stop_sequence = Some(st.sequence);
         stu.stop_id = Some(st.stop_id.clone());
 
-        if let Some(v_idx) = matched_visits[i] {
-            // PAST STOP
-            if let Some((_, visit_ts)) = state.stop_visit_timestamps.get(v_idx) {
-                let mut event = gtfs_realtime::trip_update::StopTimeEvent::default();
-                event.time = Some(*visit_ts as i64);
-                stu.arrival = Some(event.clone());
-                stu.departure = Some(event);
-                stu.schedule_relationship = Some(
-                    gtfs_realtime::trip_update::stop_time_update::ScheduleRelationship::Scheduled
-                        as i32,
-                );
-            }
-        } else {
-            // FUTURE STOP
+        if let Some(actual_ts) = matched_stops[i] {
+            // Past stop: use actual arrival time
             let mut event = gtfs_realtime::trip_update::StopTimeEvent::default();
-            event.delay = Some(estimated_delay);
+            event.time = Some(actual_ts as i64);
+            stu.arrival = Some(event.clone());
+            stu.departure = Some(event);
+        } else {
+            // Future stop: propagate delay from last visited stop
+            let mut event = gtfs_realtime::trip_update::StopTimeEvent::default();
+            event.delay = Some(propagated_delay);
 
-            if let Some(date_str) = &state.assigned_start_date {
-                if let Some(sched_secs) = st.arrival_time_secs {
-                    if let Ok(sched_ts) = get_scheduled_timestamp(date_str, sched_secs) {
-                        event.time = Some(sched_ts as i64 + estimated_delay as i64);
-                    }
+            if let Some(sched_secs) = st.arrival_time_secs {
+                if let Ok(sched_ts) = get_scheduled_timestamp(date_str, sched_secs) {
+                    event.time = Some(sched_ts as i64 + propagated_delay as i64);
                 }
             }
 
             stu.arrival = Some(event.clone());
             stu.departure = Some(event);
-            stu.schedule_relationship = Some(
-                gtfs_realtime::trip_update::stop_time_update::ScheduleRelationship::Scheduled
-                    as i32,
-            );
         }
+
+        stu.schedule_relationship = Some(
+            gtfs_realtime::trip_update::stop_time_update::ScheduleRelationship::Scheduled as i32,
+        );
         stop_time_updates.push(stu);
     }
 
     trip_update.stop_time_update = stop_time_updates;
     Some(trip_update)
-}
-
-fn calculate_interpolated_delay(
-    gtfs: &GtfsData,
-    state: &crate::matcher::history::VehicleState,
-    prev_st: &crate::gtfs::StopTime,
-    next_st: &crate::gtfs::StopTime,
-    lat: f64,
-    lon: f64,
-    current_time: u64,
-) -> Option<i64> {
-    let prev_stop = gtfs.stops.get(&prev_st.stop_id)?;
-    let next_stop = gtfs.stops.get(&next_st.stop_id)?;
-
-    let prev_time = prev_st.arrival_time_secs?;
-    let next_time = next_st.arrival_time_secs?;
-
-    if next_time < prev_time {
-        return None;
-    }
-    let segment_duration = next_time - prev_time;
-    if segment_duration == 0 {
-        return Some(0);
-    }
-
-    let dist_from_prev = haversine_distance(prev_stop.lat, prev_stop.lon, lat, lon);
-    let dist_to_next = haversine_distance(lat, lon, next_stop.lat, next_stop.lon);
-
-    let fraction = dist_from_prev / (dist_from_prev + dist_to_next);
-
-    let interpolated_sched_secs = prev_time + (segment_duration as f64 * fraction) as u32;
-
-    if let Some(date_str) = &state.assigned_start_date {
-        if let Ok(sched_ts_epoch) = get_scheduled_timestamp(date_str, interpolated_sched_secs) {
-            return Some(current_time as i64 - sched_ts_epoch as i64);
-        }
-    }
-
-    None
 }
 
 fn get_scheduled_timestamp(date_str: &str, secs_since_midnight: u32) -> Result<u64, ()> {

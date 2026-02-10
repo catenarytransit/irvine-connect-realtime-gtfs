@@ -131,6 +131,20 @@ fn generate_single_trip_update(
         }
     }
 
+    // Enforce monotonicity: timestamps must not decrease along the sequence.
+    let mut max_ts_seen = 0;
+    for matched_ts in matched_stops.iter_mut() {
+        if let Some(ts) = *matched_ts {
+            if ts < max_ts_seen {
+                // Violation: this stop claim to be visited AT 'ts', which is earlier than a previous stop.
+                // Invalidate this match.
+                *matched_ts = None;
+            } else {
+                max_ts_seen = ts;
+            }
+        }
+    }
+
     // Find the last visited stop and calculate its delay
     let mut last_visited_idx: Option<usize> = None;
     let mut propagated_delay: i32 = 0;

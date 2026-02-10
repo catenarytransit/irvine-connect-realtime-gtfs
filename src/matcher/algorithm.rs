@@ -650,6 +650,10 @@ fn score_trip_with_segmentation(
                         0.7
                     } else if delta >= -1200 && delta <= 1800 {
                         0.3
+                    } else if delta > 1800 && delta <= 7200 {
+                        0.1
+                    } else if delta >= -3600 && delta < -1200 {
+                        0.1
                     } else {
                         0.0
                     };
@@ -661,16 +665,33 @@ fn score_trip_with_segmentation(
         }
     }
 
-    // Excessive delay check
+    // Excessive delay check - LOGGING ONLY, NO DISQUALIFICATION
     if delta_count > 0 {
         let avg_delta = total_delta_sum / delta_count as f64;
         // Strictly penalize trips that are on average > 30 mins late or > 30 mins early
         if avg_delta.abs() > 1800.0 {
             println!(
-                "Trip {} disqualified due to excessive average delay: {:.1}s",
+                "Trip {} has excessive average delay: {:.1}s. Debugging details:",
                 trip.trip_id, avg_delta
             );
-            return (0.0, false);
+            
+            let mut logged = 0;
+            for (idx, ts_opt) in matched_stops.iter().enumerate() {
+                 if let Some(actual_ts) = ts_opt {
+                     if logged < 5 {
+                         let st = &stop_times[idx];
+                         if let Some(sched_secs) = st.arrival_time_secs {
+                             if let Some(sched_ts) = get_sched_ts(sched_secs) {
+                                 println!(
+                                     "  Stop {}: Sched {} (secs={}), Actual {}, Delta {}", 
+                                     st.stop_id, sched_ts, sched_secs, actual_ts, *actual_ts as i64 - sched_ts
+                                 );
+                             }
+                         }
+                         logged += 1;
+                     }
+                 }
+            }
         }
     }
 

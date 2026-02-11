@@ -24,21 +24,31 @@ pub fn generate_trip_updates(gtfs: &GtfsData, states: &VehicleStateManager) -> F
                 // Filter out stale trip updates
                 let trip = &trip_update.trip;
                 if let Some(start_date) = &trip.start_date {
-                    use chrono::{TimeZone, Datelike};
+                    use chrono::{Datelike, TimeZone};
                     use chrono_tz::America::Los_Angeles;
-                    
+
                     let now = SystemTime::now();
                     let now_utc = chrono::DateTime::<chrono::Utc>::from(now);
                     let now_la = now_utc.with_timezone(&Los_Angeles);
                     let today = now_la.format("%Y%m%d").to_string();
-                    let yesterday = now_la.date_naive().pred_opt().unwrap().format("%Y%m%d").to_string();
-                    let tomorrow = now_la.date_naive().succ_opt().unwrap().format("%Y%m%d").to_string();
-                    
+                    let yesterday = now_la
+                        .date_naive()
+                        .pred_opt()
+                        .unwrap()
+                        .format("%Y%m%d")
+                        .to_string();
+                    let tomorrow = now_la
+                        .date_naive()
+                        .succ_opt()
+                        .unwrap()
+                        .format("%Y%m%d")
+                        .to_string();
+
                     if *start_date != today && *start_date != yesterday && *start_date != tomorrow {
                         continue;
                     }
                 }
-                
+
                 let mut entity = gtfs_realtime::FeedEntity::default();
                 entity.id = format!("tu-{}", state.vehicle_id);
                 entity.trip_update = Some(trip_update);

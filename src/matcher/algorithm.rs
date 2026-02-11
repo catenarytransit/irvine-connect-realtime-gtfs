@@ -65,8 +65,8 @@ pub fn perform_global_assignment(
     // First pass: Standard assignment with segmentation
     for vehicle_id in &vehicle_ids {
         if vehicle_id.starts_with("20") && vehicle_id.len() == 5 {
-           continue;
-        } 
+            continue;
+        }
 
         if let Some(state) = state_manager.get(vehicle_id) {
             if state.position_history.len() < MIN_POSITIONS_FOR_MATCHING {
@@ -184,18 +184,28 @@ pub fn perform_global_assignment(
                         // Calculate correct start date based on service day logic
                         let trip_start_mins = trip.start_time_minutes().unwrap_or(0);
                         let current_mins = (now.hour() * 60 + now.minute()) as u32;
-                        
-                        // If trip starts late (e.g. 25:00) and it's early (e.g. 01:00), 
+
+                        // If trip starts late (e.g. 25:00) and it's early (e.g. 01:00),
                         // then delta is large positive (25*60 - 1*60 = 24*60 = 1440).
                         // If trip starts early (e.g. 00:05) and it's late (e.g. 23:55),
                         // then delta is large negative (5 - 23*55 = -1430).
-                        
+
                         let delta = trip_start_mins as i32 - current_mins as i32;
-                        
-                        let service_date = if delta > 720 { // More than 12 hours ahead -> Previous Day (e.g. 25:00 trip at 01:00)
-                            now.date_naive().pred_opt().unwrap().format("%Y%m%d").to_string()
-                        } else if delta < -720 { // More than 12 hours behind -> Next Day (e.g. 00:05 trip at 23:55)
-                             now.date_naive().succ_opt().unwrap().format("%Y%m%d").to_string()
+
+                        let service_date = if delta > 720 {
+                            // More than 12 hours ahead -> Previous Day (e.g. 25:00 trip at 01:00)
+                            now.date_naive()
+                                .pred_opt()
+                                .unwrap()
+                                .format("%Y%m%d")
+                                .to_string()
+                        } else if delta < -720 {
+                            // More than 12 hours behind -> Next Day (e.g. 00:05 trip at 23:55)
+                            now.date_naive()
+                                .succ_opt()
+                                .unwrap()
+                                .format("%Y%m%d")
+                                .to_string()
                         } else {
                             now.format("%Y%m%d").to_string()
                         };
@@ -226,9 +236,9 @@ pub fn perform_global_assignment(
         }
 
         if *score >= CONFIDENCE_THRESHOLD {
-            if !assigned_trips.contains(trip_id) {
+            if !assigned_trips.contains(&(trip_id.clone(), start_date.clone())) {
                 assigned_vehicles.insert(vehicle_id.clone());
-                assigned_trips.insert(trip_id.clone());
+                assigned_trips.insert((trip_id.clone(), start_date.clone()));
 
                 let route_id = gtfs.get_trip_by_id(trip_id).map(|t| t.route_id.clone());
                 final_assignments.insert(
@@ -281,8 +291,18 @@ pub fn perform_global_assignment(
                         let active_trip_indices = gtfs.get_active_trips(is_weekend);
                         for &idx in active_trip_indices {
                             let trip = &gtfs.trips[idx];
-                            // Skip if already assigned
-                            if assigned_trips.contains(&trip.trip_id) {
+                            // Skip if already assigned (with specific start date - though strictly we don't know the start date yet for fallback logic effortlessly without recalc.
+                            // But fallback logic usually implies "current" time roughly.
+                            // Let's assume fallback is for "today" or "now" service day.
+                            // However, we are in a loop over active trips.
+
+                            // For simplicity in fallback, we'll check if trip_id is assigned at all for *ANY* date to be safe,
+                            // OR we could try to be smarter.
+                            // Let's check generally if the trip ID is busy to avoid dupes?
+                            // Actually, with the new (trip, date) key, we can't easily check "is this trip ID used?" without iterating.
+                            // But usually fallback is last resort.
+                            // Let's map assigned_trips to just IDs for quick check or iterate.
+                            if assigned_trips.iter().any(|(t, _)| t == &trip.trip_id) {
                                 continue;
                             }
 
@@ -340,10 +360,10 @@ pub fn perform_global_assignment(
                         vehicle_id, trip.trip_id, score
                     );
                     assigned_vehicles.insert(vehicle_id.clone());
-                    assigned_trips.insert(trip.trip_id.clone());
                     let start_date = la_time
                         .map(|t| t.format("%Y%m%d").to_string())
                         .unwrap_or("20240101".to_string());
+                    assigned_trips.insert((trip.trip_id.clone(), start_date.clone()));
                     final_assignments.insert(
                         vehicle_id.clone(),
                         (
@@ -666,16 +686,25 @@ fn score_trip_with_segmentation(
                     // -5m to +10m: Good
                     // -10m to +20m: Okay
                     // -20m to +30m: Poor
+                    // Time Match Score
+                    // Adjusted to favor late trips (positive delta) to pick earlier trip IDs
+                    // -5m to +10m: Good (1.0)
+                    // +10m to +30m: Late but acceptable (0.8)
+                    // +30m to +60m: Very late (0.6)
+                    // > +60m: Poor (0.1)
+                    // Early (< -5m): Penalized more heavily to avoid picking future trips
                     let ts_score = if delta >= -300 && delta <= 600 {
                         1.0
-                    } else if delta >= -600 && delta <= 1200 {
-                        0.7
-                    } else if delta >= -1200 && delta <= 1800 {
-                        0.3
-                    } else if delta > 1800 && delta <= 7200 {
+                    } else if delta > 600 && delta <= 1800 {
+                        0.8
+                    } else if delta > 1800 && delta <= 3600 {
+                        0.6
+                    } else if delta > 3600 && delta <= 7200 {
                         0.1
-                    } else if delta >= -3600 && delta < -1200 {
-                        0.1
+                    } else if delta >= -600 && delta < -300 {
+                        0.5
+                    } else if delta < -600 {
+                        0.0 // Don't match if very early (likely wrong trip)
                     } else {
                         0.0
                     };
@@ -696,23 +725,27 @@ fn score_trip_with_segmentation(
                 "Trip {} has excessive average delay: {:.1}s. Debugging details:",
                 trip.trip_id, avg_delta
             );
-            
+
             let mut logged = 0;
             for (idx, ts_opt) in matched_stops.iter().enumerate() {
-                 if let Some(actual_ts) = ts_opt {
-                     if logged < 5 {
-                         let st = &stop_times[idx];
-                         if let Some(sched_secs) = st.arrival_time_secs {
-                             if let Some(sched_ts) = get_sched_ts(sched_secs) {
-                                 println!(
-                                     "  Stop {}: Sched {} (secs={}), Actual {}, Delta {}", 
-                                     st.stop_id, sched_ts, sched_secs, actual_ts, *actual_ts as i64 - sched_ts
-                                 );
-                             }
-                         }
-                         logged += 1;
-                     }
-                 }
+                if let Some(actual_ts) = ts_opt {
+                    if logged < 5 {
+                        let st = &stop_times[idx];
+                        if let Some(sched_secs) = st.arrival_time_secs {
+                            if let Some(sched_ts) = get_sched_ts(sched_secs) {
+                                println!(
+                                    "  Stop {}: Sched {} (secs={}), Actual {}, Delta {}",
+                                    st.stop_id,
+                                    sched_ts,
+                                    sched_secs,
+                                    actual_ts,
+                                    *actual_ts as i64 - sched_ts
+                                );
+                            }
+                        }
+                        logged += 1;
+                    }
+                }
             }
         }
     }

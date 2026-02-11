@@ -64,6 +64,10 @@ pub fn perform_global_assignment(
 
     // First pass: Standard assignment with segmentation
     for vehicle_id in &vehicle_ids {
+        if vehicle_id.starts_with("20") && vehicle_id.len() == 5 {
+           continue;
+        } 
+
         if let Some(state) = state_manager.get(vehicle_id) {
             if state.position_history.len() < MIN_POSITIONS_FOR_MATCHING {
                 continue;
@@ -177,11 +181,30 @@ pub fn perform_global_assignment(
                             }
                         );
 
+                        // Calculate correct start date based on service day logic
+                        let trip_start_mins = trip.start_time_minutes().unwrap_or(0);
+                        let current_mins = (now.hour() * 60 + now.minute()) as u32;
+                        
+                        // If trip starts late (e.g. 25:00) and it's early (e.g. 01:00), 
+                        // then delta is large positive (25*60 - 1*60 = 24*60 = 1440).
+                        // If trip starts early (e.g. 00:05) and it's late (e.g. 23:55),
+                        // then delta is large negative (5 - 23*55 = -1430).
+                        
+                        let delta = trip_start_mins as i32 - current_mins as i32;
+                        
+                        let service_date = if delta > 720 { // More than 12 hours ahead -> Previous Day (e.g. 25:00 trip at 01:00)
+                            now.date_naive().pred_opt().unwrap().format("%Y%m%d").to_string()
+                        } else if delta < -720 { // More than 12 hours behind -> Next Day (e.g. 00:05 trip at 23:55)
+                             now.date_naive().succ_opt().unwrap().format("%Y%m%d").to_string()
+                        } else {
+                            now.format("%Y%m%d").to_string()
+                        };
+
                         all_matches.push((
                             final_score,
                             vehicle_id.clone(),
                             trip.trip_id.clone(),
-                            now.format("%Y%m%d").to_string(),
+                            service_date,
                         ));
                     }
                 }
@@ -539,7 +562,6 @@ fn score_trip_with_segmentation(
         d.clone()
     } else {
         // Fallback to today
-        let now = SystemTime::now();
         // We really want the date of the position timestamps usually, but
         // for candidate scoring we are usually looking at "now" or recent.
         // Let's assume the trip runs "today" relative to the vehicle positions.

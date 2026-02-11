@@ -17,11 +17,6 @@ pub fn generate_trip_updates(gtfs: &GtfsData, states: &VehicleStateManager) -> F
     feed.header = header;
 
     for state in states.all_states() {
-        // Filter out invalid vehicle IDs
-        if state.vehicle_id.starts_with("20000") {
-            continue;
-        }
-
         if let Some(trip_id) = &state.assigned_trip_id {
             if let Some(trip_update) =
                 generate_single_trip_update(gtfs, state, trip_id, current_time)

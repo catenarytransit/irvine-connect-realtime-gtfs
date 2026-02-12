@@ -3,7 +3,7 @@ use crate::matcher::history::VehicleState;
 use crate::matcher::proximity::{find_nearest_stop_on_trip, haversine_distance};
 use chrono::{Datelike, TimeZone, Timelike};
 use chrono_tz::America::Los_Angeles;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::SystemTime;
 
 const MIN_POSITIONS_FOR_MATCHING: usize = 5;
@@ -61,8 +61,9 @@ pub fn perform_global_assignment(
         .collect();
 
     let mut all_matches: Vec<(f64, String, String, String)> = Vec::new();
+    let mut fallback_routes = HashMap::new();
 
-    // First pass: Standard assignment with segmentation
+    // First pass: Find candidates for all vehicles
     for vehicle_id in &vehicle_ids {
         if vehicle_id.starts_with("20") && vehicle_id.len() == 5 {
             continue;
@@ -124,7 +125,7 @@ pub fn perform_global_assignment(
                         classify_terminus_visits_for_trip(state, trip, &raw_terminus_visits, gtfs);
                     let segment_start = find_segment_boundary(&terminus_visits);
 
-                    let (score, transition_detected) = score_trip_with_segmentation(
+                    let (mut score, transition_detected) = score_trip_with_segmentation(
                         state,
                         trip,
                         gtfs,
@@ -133,11 +134,9 @@ pub fn perform_global_assignment(
                     );
 
                     if score > 0.0 {
-                        let mut final_score = score;
-
                         // Stability bonus for staying on same trip
                         if state.assigned_trip_id.as_deref() == Some(&trip.trip_id) {
-                            final_score += 0.05;
+                            score += 0.05;
                         }
 
                         // Transition bonus
@@ -149,11 +148,7 @@ pub fn perform_global_assignment(
                                     || state.previous_trip_id.as_deref()
                                         == Some(&prev_in_block.trip_id)
                                 {
-                                    println!(
-                                        "Vehicle {} - Transition detected from {} to {}",
-                                        vehicle_id, prev_in_block.trip_id, trip.trip_id
-                                    );
-                                    final_score *= TRANSITION_BONUS;
+                                    score *= TRANSITION_BONUS;
                                 }
                             }
                         }
@@ -173,7 +168,7 @@ pub fn perform_global_assignment(
                             "Vehicle {} - Trip {} score: {:.3}{}",
                             vehicle_id,
                             trip.trip_id,
-                            final_score,
+                            score,
                             if transition_detected {
                                 " [TRANSITION]"
                             } else {
@@ -211,249 +206,266 @@ pub fn perform_global_assignment(
                         };
 
                         all_matches.push((
-                            final_score,
+                            score,
                             vehicle_id.clone(),
                             trip.trip_id.clone(),
                             service_date,
                         ));
+
+                        // Store route hint
+                        let route_hint = trip.route_id.clone();
+                        fallback_routes
+                            .entry(vehicle_id.clone())
+                            .and_modify(|r| {
+                                if score > 0.5 {
+                                    *r = route_hint.clone();
+                                }
+                            })
+                            .or_insert(route_hint);
                     }
                 }
             }
         }
     }
 
-    all_matches.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Min-Cost Max-Flow Assignment
+    let mut unique_trips = HashSet::new();
+    let mut vehicle_map = HashMap::new();
+    let mut trip_map = HashMap::new();
+    let mut vehicle_list = Vec::new();
+    let mut trip_list = Vec::new();
 
-    let mut assigned_trips = HashSet::new();
-    let mut assigned_vehicles = HashSet::new();
-    let mut final_assignments = HashMap::new();
-    let mut fallback_routes = HashMap::new();
-
-    // Apply confident matches
-    for (score, vehicle_id, trip_id, start_date) in &all_matches {
-        if assigned_vehicles.contains(vehicle_id) {
-            continue;
+    for (_, v, t, d) in &all_matches {
+        if !vehicle_map.contains_key(v) {
+            vehicle_map.insert(v.clone(), vehicle_list.len());
+            vehicle_list.push(v.clone());
         }
-
-        if *score >= CONFIDENCE_THRESHOLD {
-            if !assigned_trips.contains(&(trip_id.clone(), start_date.clone())) {
-                assigned_vehicles.insert(vehicle_id.clone());
-                assigned_trips.insert((trip_id.clone(), start_date.clone()));
-
-                let route_id = gtfs.get_trip_by_id(trip_id).map(|t| t.route_id.clone());
-                final_assignments.insert(
-                    vehicle_id.clone(),
-                    (trip_id.clone(), route_id, start_date.clone(), *score),
-                );
-            }
-        } else {
-            if !fallback_routes.contains_key(vehicle_id) {
-                if let Some(trip) = gtfs.get_trip_by_id(trip_id) {
-                    fallback_routes.insert(vehicle_id.clone(), trip.route_id.clone());
-                }
-            }
+        let trip_key = (t.clone(), d.clone());
+        if !unique_trips.contains(&trip_key) {
+            unique_trips.insert(trip_key.clone());
+            trip_map.insert(trip_key.clone(), trip_list.len());
+            trip_list.push(trip_key);
         }
     }
 
-    // Spatial Fallback Pass for unassigned vehicles
-    for vehicle_id in &vehicle_ids {
-        if assigned_vehicles.contains(vehicle_id) {
-            continue;
+    let num_vehicles = vehicle_list.len();
+    let num_trips = trip_list.len();
+    if num_vehicles > 0 && num_trips > 0 {
+        let source = 0;
+        let sink = num_vehicles + num_trips + 1;
+        let capacity = sink + 1;
+
+        let mut mcmf = MinCostMaxFlow::new(capacity);
+
+        // Edges from Source to Vehicles
+        for i in 0..num_vehicles {
+            mcmf.add_edge(source, i + 1, 1, 0);
         }
 
-        if let Some(state) = state_manager.get(vehicle_id) {
-            if let Some(last_pos) = state.position_history.back() {
-                // Find nearest stops
-                let mut valid_fallback: Option<(&Trip, f64)> = None;
+        // Edges from Trips to Sink
+        for i in 0..num_trips {
+            mcmf.add_edge(num_vehicles + i + 1, sink, 1, 0);
+        }
 
-                let la_time = Los_Angeles
-                    .timestamp_opt(last_pos.timestamp as i64, 0)
-                    .single();
+        // Edges from Vehicles to Trips
+        for (score, v, t, d) in &all_matches {
+            if let Some(&v_idx) = vehicle_map.get(v) {
+                if let Some(&t_idx) = trip_map.get(&(t.clone(), d.clone())) {
+                    // Cost = -(Base + Score) * 1000
+                    // Base = 1000 to prioritize assignment count
+                    let cost = -((1000.0 + score) * 1000.0) as i64;
+                    mcmf.add_edge(v_idx + 1, num_vehicles + t_idx + 1, 1, cost);
+                }
+            }
+        }
 
-                if let Some(now) = la_time {
-                    let current_secs =
-                        (now.hour() * 3600 + now.minute() * 60 + now.second()) as u32;
-                    let is_weekend = now.weekday().num_days_from_monday() >= 5;
+        mcmf.solve(source, sink);
 
-                    // Optimization: Filter active trips first, then check geometry?
-                    // Or finding nearby stops is cheap?
-                    // Let's find stops within 500m
-                    let nearby_stop_ids: Vec<&String> = gtfs
-                        .stops
-                        .values()
-                        .filter(|s| {
-                            haversine_distance(last_pos.lat, last_pos.lon, s.lat, s.lon) < 500.0
-                        })
-                        .map(|s| &s.id)
-                        .collect();
+        let mut assigned_vehicles = HashSet::new();
+        let mut assigned_trips = HashSet::new();
+        let mut final_assignments = HashMap::new();
 
-                    if !nearby_stop_ids.is_empty() {
-                        let active_trip_indices = gtfs.get_active_trips(is_weekend);
-                        for &idx in active_trip_indices {
-                            let trip = &gtfs.trips[idx];
-                            // Skip if already assigned (with specific start date - though strictly we don't know the start date yet for fallback logic effortlessly without recalc.
-                            // But fallback logic usually implies "current" time roughly.
-                            // Let's assume fallback is for "today" or "now" service day.
-                            // However, we are in a loop over active trips.
+        // Extract assignments
+        for v_idx in 0..num_vehicles {
+            for edge in &mcmf.graph[v_idx + 1] {
+                if edge.to > num_vehicles && edge.to <= num_vehicles + num_trips && edge.flow > 0 {
+                    let t_idx = edge.to - num_vehicles - 1;
+                    let vehicle_id = &vehicle_list[v_idx];
+                    let (trip_id, date) = &trip_list[t_idx];
 
-                            // For simplicity in fallback, we'll check if trip_id is assigned at all for *ANY* date to be safe,
-                            // OR we could try to be smarter.
-                            // Let's check generally if the trip ID is busy to avoid dupes?
-                            // Actually, with the new (trip, date) key, we can't easily check "is this trip ID used?" without iterating.
-                            // But usually fallback is last resort.
-                            // Let's map assigned_trips to just IDs for quick check or iterate.
-                            if assigned_trips.iter().any(|(t, _)| t == &trip.trip_id) {
-                                continue;
-                            }
+                    // Find original score
+                    let score = all_matches
+                        .iter()
+                        .find(|(_, v, t, d)| v == vehicle_id && t == trip_id && d == date)
+                        .map(|(s, _, _, _)| *s)
+                        .unwrap_or(0.0);
 
-                            // Check if trip visits any nearby stop within time window
-                            for st in &trip.stop_times {
-                                if nearby_stop_ids.contains(&&st.stop_id) {
-                                    // Check time
-                                    if let Some(arrival) = st.arrival_time_secs {
-                                        let diff = (arrival as i32 - current_secs as i32).abs();
-                                        // +/- 20 minutes = 1200 seconds
-                                        if diff <= 1200 {
-                                            // Found a match!
-                                            // Run full scoring to verify history sequence
-                                            // Since we have no segment info (fallback), treat as arriving (full history)
-                                            // or try to segment?
-                                            // For fallback, simpler might be better, but let's try segmentation.
+                    if score >= CONFIDENCE_THRESHOLD {
+                        assigned_vehicles.insert(vehicle_id.clone());
+                        assigned_trips.insert((trip_id.clone(), date.clone()));
+                        let route_id = gtfs.get_trip_by_id(trip_id).map(|t| t.route_id.clone());
 
-                                            let raw_terminus_visits =
-                                                find_raw_terminus_visits(state);
-                                            let terminus_visits = classify_terminus_visits_for_trip(
-                                                state,
-                                                trip,
-                                                &raw_terminus_visits,
-                                                gtfs,
-                                            );
-                                            let segment_start =
-                                                find_segment_boundary(&terminus_visits);
+                        final_assignments.insert(
+                            vehicle_id.clone(),
+                            (trip_id.clone(), route_id, date.clone(), score),
+                        );
+                        println!(
+                            "Assigned {} to {} (score {:.3}) via MCMF",
+                            vehicle_id, trip_id, score
+                        );
+                    }
+                }
+            }
+        }
 
-                                            let (score, _) = score_trip_with_segmentation(
-                                                state,
-                                                trip,
-                                                gtfs,
-                                                segment_start,
-                                                &terminus_visits,
-                                            );
+        // Spatial Fallback (for unassigned vehicles)
+        for vehicle_id in &vehicle_ids {
+            if assigned_vehicles.contains(vehicle_id) {
+                continue;
+            }
 
-                                            // If score is decent (even if low confidence), take it
-                                            if score > 0.05 {
-                                                // Use same low threshold
-                                                if valid_fallback.map_or(true, |(_, s)| score > s) {
-                                                    valid_fallback = Some((trip, score));
-                                                }
+            if let Some(state) = state_manager.get(vehicle_id) {
+                if let Some(last_pos) = state.position_history.back() {
+                    let la_time = Los_Angeles
+                        .timestamp_opt(last_pos.timestamp as i64, 0)
+                        .single();
+
+                    if let Some(now) = la_time {
+                        let current_secs =
+                            (now.hour() * 3600 + now.minute() * 60 + now.second()) as u32;
+                        let is_weekend = now.weekday().num_days_from_monday() >= 5;
+
+                        let nearby_stop_ids: Vec<&String> = gtfs
+                            .stops
+                            .values()
+                            .filter(|s| {
+                                haversine_distance(last_pos.lat, last_pos.lon, s.lat, s.lon) < 500.0
+                            })
+                            .map(|s| &s.id)
+                            .collect();
+
+                        if !nearby_stop_ids.is_empty() {
+                            let active_trips = gtfs.get_active_trips(is_weekend);
+                            let mut best_fallback: Option<(&Trip, f64)> = None;
+
+                            for &idx in active_trips {
+                                let trip = &gtfs.trips[idx];
+                                let date_str = now.format("%Y%m%d").to_string();
+                                if assigned_trips
+                                    .contains(&(trip.trip_id.clone(), date_str.clone()))
+                                {
+                                    continue;
+                                }
+
+                                let mut relevant_trip = false;
+                                for st in &trip.stop_times {
+                                    if nearby_stop_ids.contains(&&st.stop_id) {
+                                        if let Some(arr) = st.arrival_time_secs {
+                                            if (arr as i32 - current_secs as i32).abs() <= 1200 {
+                                                relevant_trip = true;
+                                                break;
                                             }
                                         }
                                     }
                                 }
+
+                                if relevant_trip {
+                                    let raw_visits = find_raw_terminus_visits(state);
+                                    let visits = classify_terminus_visits_for_trip(
+                                        state,
+                                        trip,
+                                        &raw_visits,
+                                        gtfs,
+                                    );
+                                    let seg = find_segment_boundary(&visits);
+                                    let (score, _) = score_trip_with_segmentation(
+                                        state, trip, gtfs, seg, &visits,
+                                    );
+
+                                    if score > 0.05 {
+                                        if best_fallback.map_or(true, |(_, s)| score > s) {
+                                            best_fallback = Some((trip, score));
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some((trip, score)) = best_fallback {
+                                let date = now.format("%Y%m%d").to_string();
+                                assigned_vehicles.insert(vehicle_id.clone());
+                                assigned_trips.insert((trip.trip_id.clone(), date.clone()));
+                                final_assignments.insert(
+                                    vehicle_id.clone(),
+                                    (
+                                        trip.trip_id.clone(),
+                                        Some(trip.route_id.clone()),
+                                        date,
+                                        score,
+                                    ),
+                                );
+                                println!(
+                                    "Fallback assigned {} to {} (score {:.3})",
+                                    vehicle_id, trip.trip_id, score
+                                );
                             }
                         }
                     }
                 }
-
-                if let Some((trip, score)) = valid_fallback {
-                    println!(
-                        "Vehicle {} - Spatial Fallback assigned {} (score {:.2})",
-                        vehicle_id, trip.trip_id, score
-                    );
-                    assigned_vehicles.insert(vehicle_id.clone());
-                    let start_date = la_time
-                        .map(|t| t.format("%Y%m%d").to_string())
-                        .unwrap_or("20240101".to_string());
-                    assigned_trips.insert((trip.trip_id.clone(), start_date.clone()));
-                    final_assignments.insert(
-                        vehicle_id.clone(),
-                        (
-                            trip.trip_id.clone(),
-                            Some(trip.route_id.clone()),
-                            start_date,
-                            score,
-                        ),
-                    );
-                }
             }
         }
-    }
 
-    // Apply assignments to state
-    for vehicle_id in &vehicle_ids {
-        if let Some(state) = state_manager.get_mut(vehicle_id) {
-            let fallback_route = fallback_routes.get(vehicle_id).cloned();
-
-            if let Some((trip_id, route_id, start_date, score)) = final_assignments.get(vehicle_id)
-            {
-                if state.assigned_trip_id.as_ref() != Some(trip_id) {
+        // Apply assignments
+        for vehicle_id in &vehicle_ids {
+            if let Some(state) = state_manager.get_mut(vehicle_id) {
+                if let Some((trip_id, route_id, start_date, score)) =
+                    final_assignments.get(vehicle_id)
+                {
                     let is_block_transition =
-                        state.assigned_trip_id.as_ref().map_or(false, |current| {
-                            gtfs.get_next_trip_in_block(current)
-                                .map(|next| &next.trip_id == trip_id)
+                        state.assigned_trip_id.as_ref().map_or(false, |curr| {
+                            gtfs.get_next_trip_in_block(curr)
+                                .map(|n| &n.trip_id == trip_id)
                                 .unwrap_or(false)
                         });
 
                     if is_block_transition {
-                        println!(
-                            "Block transition: {} -> {} for vehicle {} (score: {:.3})",
-                            state.assigned_trip_id.as_deref().unwrap_or("none"),
-                            trip_id,
-                            vehicle_id,
-                            score
-                        );
-                        let timestamp = state
+                        let ts = state
                             .position_history
                             .back()
                             .map(|p| p.timestamp)
                             .unwrap_or(0);
-                        state.transition_to_new_trip(trip_id.as_str(), timestamp);
+                        state.transition_to_new_trip(trip_id.as_str(), ts);
                         state.route_id = route_id.clone();
                         state.assigned_start_date = Some(start_date.clone());
                         state.trip_confidence = *score;
-                    } else {
-                        println!(
-                            "Assigning trip {} to vehicle {} (score: {:.3})",
-                            trip_id, vehicle_id, score
-                        );
+                    } else if state.assigned_trip_id.as_ref() != Some(trip_id) {
                         state.assigned_trip_id = Some(trip_id.clone());
                         state.route_id = route_id.clone();
                         state.assigned_start_date = Some(start_date.clone());
                         state.trip_confidence = *score;
+                    } else {
+                        state.trip_confidence = *score;
+                        if state.route_id.is_none() {
+                            state.route_id = route_id.clone();
+                        }
                     }
                 } else {
-                    state.trip_confidence = *score;
-                    if state.route_id.is_none() {
-                        state.route_id = route_id.clone();
-                    }
-                }
-            } else {
-                // No assignment
-                if state.assigned_trip_id.is_some() {
-                    println!(
-                        "Vehicle {} lost its assignment (no valid match found)",
-                        vehicle_id
-                    );
-                    state.assigned_trip_id = None;
-                    state.assigned_start_date = None;
-                    state.trip_confidence = 0.0;
-
-                    state.route_id = fallback_route;
-                    if let Some(r) = &state.route_id {
-                        println!("Vehicle {} fallback to route {}", vehicle_id, r);
-                    }
-                } else {
-                    if let Some(r) = fallback_route {
-                        if state.route_id.as_ref() != Some(&r) {
+                    if state.assigned_trip_id.is_some() {
+                        println!("Vehicle {} lost assignment", vehicle_id);
+                        state.assigned_trip_id = None;
+                        state.assigned_start_date = None;
+                        state.trip_confidence = 0.0;
+                        if let Some(r) = fallback_routes.get(vehicle_id) {
                             state.route_id = Some(r.clone());
-                            println!("Vehicle {} assigned fallback route {}", vehicle_id, r);
+                        }
+                    } else if let Some(r) = fallback_routes.get(vehicle_id) {
+                        if state.route_id.as_ref() != Some(r) {
+                            state.route_id = Some(r.clone());
                         }
                     }
                 }
             }
         }
     }
-
-    println!("Processed {} vehicles", vehicle_ids.len());
 }
 
 /// Find all positions where the vehicle was at or near the terminus (location only)
@@ -877,4 +889,104 @@ fn find_candidate_trips(gtfs: &GtfsData, is_weekend: bool, current_secs: u32) ->
             None
         })
         .collect()
+}
+
+#[derive(Clone)]
+struct Edge {
+    to: usize,
+    capacity: i32,
+    flow: i32,
+    cost: i64,
+    reverse_edge: usize,
+}
+
+struct MinCostMaxFlow {
+    graph: Vec<Vec<Edge>>,
+}
+
+impl MinCostMaxFlow {
+    fn new(n: usize) -> Self {
+        Self {
+            graph: vec![Vec::new(); n],
+        }
+    }
+
+    fn add_edge(&mut self, from: usize, to: usize, capacity: i32, cost: i64) {
+        let forward_edge = Edge {
+            to,
+            capacity,
+            flow: 0,
+            cost,
+            reverse_edge: self.graph[to].len(),
+        };
+        let backward_edge = Edge {
+            to: from,
+            capacity: 0,
+            flow: 0,
+            cost: -cost,
+            reverse_edge: self.graph[from].len(),
+        };
+        self.graph[from].push(forward_edge);
+        self.graph[to].push(backward_edge);
+    }
+
+    fn solve(&mut self, s: usize, t: usize) -> (i32, i64) {
+        let mut total_flow = 0;
+        let mut min_cost = 0;
+        let n = self.graph.len();
+
+        loop {
+            let mut dist = vec![i64::MAX; n];
+            let mut parent = vec![None; n];
+            let mut edge_from = vec![None; n];
+            let mut in_queue = vec![false; n];
+            let mut queue = VecDeque::new();
+
+            dist[s] = 0;
+            queue.push_back(s);
+            in_queue[s] = true;
+
+            while let Some(u) = queue.pop_front() {
+                in_queue[u] = false;
+                for (i, e) in self.graph[u].iter().enumerate() {
+                    if e.capacity > e.flow && dist[e.to] > dist[u].saturating_add(e.cost) {
+                        dist[e.to] = dist[u] + e.cost;
+                        parent[e.to] = Some(u);
+                        edge_from[e.to] = Some(i);
+                        if !in_queue[e.to] {
+                            queue.push_back(e.to);
+                            in_queue[e.to] = true;
+                        }
+                    }
+                }
+            }
+
+            if dist[t] == i64::MAX {
+                break;
+            }
+
+            let mut flow = i32::MAX;
+            let mut curr = t;
+            while curr != s {
+                let p = parent[curr].unwrap();
+                let idx = edge_from[curr].unwrap();
+                flow = flow.min(self.graph[p][idx].capacity - self.graph[p][idx].flow);
+                curr = p;
+            }
+
+            total_flow += flow;
+            min_cost += flow as i64 * dist[t];
+            curr = t;
+            while curr != s {
+                let p = parent[curr].unwrap();
+                let idx = edge_from[curr].unwrap();
+                self.graph[p][idx].flow += flow;
+                let rev_idx = self.graph[p][idx].reverse_edge;
+                self.graph[curr][rev_idx].flow -= flow;
+                curr = p;
+            }
+        }
+
+        (total_flow, min_cost)
+    }
 }

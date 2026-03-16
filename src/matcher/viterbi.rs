@@ -113,6 +113,10 @@ pub fn viterbi_score(
         let prev_pos = positions[t - 1];
         let d_euclidean = haversine_distance(prev_pos.lat, prev_pos.lon, pos.lat, pos.lon);
 
+        // GPS displacement vector (in degrees, used only for direction)
+        let gps_dlat = pos.lat - prev_pos.lat;
+        let gps_dlon = pos.lon - prev_pos.lon;
+
         let mut curr_log_prob: Vec<f64> = vec![f64::NEG_INFINITY; num_stops];
         let mut curr_path: Vec<Vec<usize>> = vec![Vec::new(); num_stops];
         let mut step_best_j = window_center;
@@ -135,9 +139,7 @@ pub fn viterbi_score(
                 MIN_EMISSION_LOG
             };
 
-            // Find best predecessor
             let i_lo = j_lo;
-            // Only allow forward or same-stop transitions (monotonic along trip)
             let i_hi = (j + 1).min(j_hi);
 
             let mut best_prev_log = f64::NEG_INFINITY;
@@ -156,7 +158,38 @@ pub fn viterbi_score(
                     MIN_EMISSION_LOG
                 };
 
-                let candidate = prev_log_prob[i] + log_tp;
+                // Velocity vector consistency: dot product of GPS displacement
+                // with the route direction (stop_i → stop_j).
+                // Penalizes transitions where the vehicle moves against the route.
+                let dir_log = if i != j {
+                    if let (Some((i_lat, i_lon)), Some((j_lat, j_lon))) =
+                        (stop_coords[i], stop_coords[j])
+                    {
+                        let route_dlat = j_lat - i_lat;
+                        let route_dlon = j_lon - i_lon;
+                        let dot = gps_dlat * route_dlat + gps_dlon * route_dlon;
+                        let gps_mag = (gps_dlat * gps_dlat + gps_dlon * gps_dlon).sqrt();
+                        let route_mag = (route_dlat * route_dlat + route_dlon * route_dlon).sqrt();
+
+                        if gps_mag > 1e-9 && route_mag > 1e-9 {
+                            let cos_angle = (dot / (gps_mag * route_mag)).clamp(-1.0, 1.0);
+                            // Map cos_angle [-1, 1] to a multiplier:
+                            //   cos=1 (same direction)    → 1.0
+                            //   cos=0 (perpendicular)     → 0.5
+                            //   cos=-1 (opposite)         → ~0  (heavy penalty)
+                            let factor = ((1.0 + cos_angle) / 2.0).powi(2);
+                            factor.max(0.01).ln()
+                        } else {
+                            0.0 // stationary or coincident stops, no directional info
+                        }
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0 // staying at the same stop — no directional constraint
+                };
+
+                let candidate = prev_log_prob[i] + log_tp + dir_log;
                 if candidate > best_prev_log {
                     best_prev_log = candidate;
                     best_prev_i = i;

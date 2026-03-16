@@ -2,12 +2,68 @@ use crate::gtfs::GtfsData;
 use crate::matcher::{VehicleStateManager, algorithm, updates};
 use prost::Message;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
 const REALTIME_URL: &str =
     "https://passio3.com/irvine/passioTransit/gtfs/realtime/vehiclePositions";
 const FETCH_INTERVAL_MS: u64 = 1000;
+const PROXY_LIST_URL: &str =
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/US/data.txt";
+
+struct ProxyManager {
+    clients: Vec<reqwest::Client>,
+    current_index: AtomicUsize,
+}
+
+impl ProxyManager {
+    async fn new(proxy_url: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let mut clients = Vec::new();
+        // Add direct connection as fallback
+        clients.push(reqwest::Client::new());
+
+        let fallback_client = reqwest::Client::new();
+        let proxies_response = fallback_client.get(proxy_url).send().await;
+        if let Ok(resp) = proxies_response {
+            if resp.status().is_success() {
+                if let Ok(text) = resp.text().await {
+                    for line in text.lines() {
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        if let Ok(proxy) = reqwest::Proxy::all(line) {
+                            if let Ok(client) = reqwest::Client::builder().proxy(proxy).build() {
+                                clients.push(client);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        use rand::seq::SliceRandom;
+        use rand::thread_rng;
+        clients.shuffle(&mut thread_rng());
+
+        println!("Loaded {} proxy clients", clients.len());
+
+        Ok(Self {
+            clients,
+            current_index: AtomicUsize::new(0),
+        })
+    }
+
+    fn get_client(&self) -> &reqwest::Client {
+        let idx = self.current_index.load(Ordering::Relaxed) % self.clients.len();
+        &self.clients[idx]
+    }
+
+    fn rotate_client(&self) {
+        self.current_index.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 pub async fn run_fetcher(
     gtfs: Arc<GtfsData>,
@@ -19,12 +75,26 @@ pub async fn run_fetcher(
         "Starting realtime fetcher, polling every {}ms",
         FETCH_INTERVAL_MS
     );
-    let client = reqwest::Client::new();
+    let proxy_manager = ProxyManager::new(PROXY_LIST_URL).await.unwrap_or_else(|_| {
+        println!("Failed to setup proxies, falling back to direct client");
+        ProxyManager {
+            clients: vec![reqwest::Client::new()],
+            current_index: AtomicUsize::new(0),
+        }
+    });
 
     let mut current_iteration = 0;
 
     loop {
-        match fetch_and_process(&client, &gtfs, &states, &current_feed, &trip_updates_feed).await {
+        match fetch_and_process(
+            &proxy_manager,
+            &gtfs,
+            &states,
+            &current_feed,
+            &trip_updates_feed,
+        )
+        .await
+        {
             Ok(count) => {
                 println!("Processed {} vehicles", count);
             }
@@ -48,13 +118,34 @@ pub async fn run_fetcher(
 }
 
 async fn fetch_and_process(
-    client: &reqwest::Client,
+    proxy_manager: &ProxyManager,
     gtfs: &GtfsData,
     states: &RwLock<VehicleStateManager>,
     current_feed: &RwLock<Option<gtfs_realtime::FeedMessage>>,
     trip_updates_feed: &RwLock<Option<gtfs_realtime::FeedMessage>>,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let response = client.get(REALTIME_URL).send().await?;
+    let client = proxy_manager.get_client();
+
+    let response_result = client.get(REALTIME_URL).send().await;
+    let response = match response_result {
+        Ok(res) => res,
+        Err(e) => {
+            // If the connection failed completely, also rotate
+            proxy_manager.rotate_client();
+            return Err(e.into());
+        }
+    };
+
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        proxy_manager.rotate_client();
+        return Err("429 Too Many Requests, rotating proxy".into());
+    } else if !response.status().is_success() {
+        // We might also want to rotate on 403 or 500s sometimes from bad proxies,
+        // but let's strictly follow rotating when needed or just pass the error
+        let status = response.status();
+        return Err(format!("HTTP Error: {}", status).into());
+    }
+
     let bytes = response.bytes().await?;
 
     let feed = gtfs_realtime::FeedMessage::decode(bytes.as_ref())?;

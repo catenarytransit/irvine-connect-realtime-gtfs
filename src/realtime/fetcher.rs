@@ -85,6 +85,8 @@ pub async fn run_fetcher(
     let mut current_iteration = 0;
 
     loop {
+        let mut should_skip_sleep = false;
+
         match fetch_and_process(
             &proxy_manager,
             &gtfs,
@@ -94,8 +96,6 @@ pub async fn run_fetcher(
         )
         .await
         {
-            let mut should_skip_sleep = false;
-
             Ok(count) => {
                 println!("Processed {} vehicles", count);
             }

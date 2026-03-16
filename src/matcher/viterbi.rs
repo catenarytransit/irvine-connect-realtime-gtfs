@@ -1,6 +1,7 @@
 use crate::gtfs::{GtfsData, Trip};
 use crate::matcher::history::TimestampedPosition;
 use crate::matcher::proximity::{emission_probability, haversine_distance, transition_probability};
+use chrono::TimeDelta;
 use chrono::TimeZone;
 use chrono_tz::America::Los_Angeles;
 
@@ -51,7 +52,7 @@ fn route_distance(cumulative: &[f64], from: usize, to: usize) -> f64 {
 fn service_day_base(date_str: &str) -> Option<i64> {
     use chrono::NaiveDate;
     let date = NaiveDate::parse_from_str(date_str, "%Y%m%d").ok()?;
-    let naive_dt = date.and_hms_opt(0, 0, 0)?;
+    let naive_dt = date.and_hms_opt(12, 0, 0)? - TimeDelta::try_seconds(43200).unwrap();
     let base_dt = Los_Angeles.from_local_datetime(&naive_dt).single()?;
     Some(base_dt.timestamp())
 }
@@ -172,11 +173,8 @@ pub fn viterbi_score(
                 MIN_EMISSION_LOG
             };
 
-            let time_pen = temporal_log_penalty(
-                pos.timestamp,
-                trip.stop_times[j].arrival_time_secs,
-                base_ts,
-            );
+            let time_pen =
+                temporal_log_penalty(pos.timestamp, trip.stop_times[j].arrival_time_secs, base_ts);
 
             let i_lo = j_lo;
             let i_hi = (j + 1).min(j_hi);
@@ -206,8 +204,7 @@ pub fn viterbi_score(
                         let route_dlon = j_lon - i_lon;
                         let dot = gps_dlat * route_dlat + gps_dlon * route_dlon;
                         let gps_mag = (gps_dlat * gps_dlat + gps_dlon * gps_dlon).sqrt();
-                        let route_mag =
-                            (route_dlat * route_dlat + route_dlon * route_dlon).sqrt();
+                        let route_mag = (route_dlat * route_dlat + route_dlon * route_dlon).sqrt();
 
                         if gps_mag > 1e-9 && route_mag > 1e-9 {
                             let cos_angle = (dot / (gps_mag * route_mag)).clamp(-1.0, 1.0);

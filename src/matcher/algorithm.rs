@@ -602,8 +602,6 @@ fn score_trip_with_segmentation(
         return (0.0, false);
     }
 
-
-
     let get_sched_ts = |secs: u32| -> Option<i64> {
         use chrono::NaiveDate;
         if let Ok(date) = NaiveDate::parse_from_str(&date_str, "%Y%m%d") {

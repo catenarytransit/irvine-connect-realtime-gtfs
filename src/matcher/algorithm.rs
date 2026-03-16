@@ -990,3 +990,41 @@ impl MinCostMaxFlow {
         (total_flow, min_cost)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_min_cost_max_flow_global_opt() {
+        // Case: V1 prefers T1 (10), T2 (9). V2 only matches T1 (9).
+        // Greedy (by max score): V1->T1 (10). V2 unmatched. Total 10. Flow 1.
+        // Global: V1->T2 (9), V2->T1 (9). Total 18. Flow 2.
+        
+        let mut mcmf = MinCostMaxFlow::new(6);
+        // Source 0, Sink 5
+        // V1=1, V2=2
+        // T1=3, T2=4
+        
+        // Source -> Vehicles
+        mcmf.add_edge(0, 1, 1, 0);
+        mcmf.add_edge(0, 2, 1, 0);
+        
+        // Trips -> Sink
+        mcmf.add_edge(3, 5, 1, 0);
+        mcmf.add_edge(4, 5, 1, 0);
+
+        // Edges
+        // V1->T1 (Cost -10)
+        mcmf.add_edge(1, 3, 1, -10);
+        // V1->T2 (Cost -9)
+        mcmf.add_edge(1, 4, 1, -9);
+        // V2->T1 (Cost -9)
+        mcmf.add_edge(2, 3, 1, -9);
+
+        let (flow, cost) = mcmf.solve(0, 5);
+        
+        assert_eq!(flow, 2, "Should assign both vehicles");
+        assert_eq!(cost, -18, "Should minimize cost (maximize score) to -18");
+    }
+}

@@ -1,5 +1,7 @@
 use crate::gtfs::GtfsData;
 use crate::matcher::{VehicleStateManager, algorithm, updates};
+use chrono::Timelike;
+use chrono::Utc;
 use prost::Message;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -87,21 +89,45 @@ pub async fn run_fetcher(
     loop {
         let mut should_skip_sleep = false;
 
-        match fetch_and_process(
-            &proxy_manager,
-            &gtfs,
-            &states,
-            &current_feed,
-            &trip_updates_feed,
-        )
-        .await
-        {
-            Ok(count) => {
-                println!("Processed {} vehicles", count);
+        let now_utc = Utc::now();
+        let current_california_local_time = now_utc.with_timezone(&chrono_tz::America::Los_Angeles);
+        let hour: u32 = current_california_local_time.hour();
+
+        if (hour < 5 || hour > 23) {
+            match fetch_and_process(
+                &proxy_manager,
+                &gtfs,
+                &states,
+                &current_feed,
+                &trip_updates_feed,
+            )
+            .await
+            {
+                Ok(count) => {
+                    println!("Processed {} vehicles", count);
+                }
+                Err(e) => {
+                    should_skip_sleep = true;
+                    eprintln!("Fetch error: {}", e);
+                }
             }
-            Err(e) => {
-                should_skip_sleep = true;
-                eprintln!("Fetch error: {}", e);
+        } else {
+            match fetch_and_process(
+                &proxy_manager,
+                &gtfs,
+                &states,
+                &current_feed,
+                &trip_updates_feed,
+            )
+            .await
+            {
+                Ok(count) => {
+                    println!("Processed {} vehicles", count);
+                }
+                Err(e) => {
+                    should_skip_sleep = true;
+                    eprintln!("Fetch error: {}", e);
+                }
             }
         }
 

@@ -140,6 +140,7 @@ async fn fetch_and_process(
     } else if !response.status().is_success() {
         let status = response.status();
         return Err(format!("HTTP Error: {}", status).into());
+        proxy_manager.rotate_client();
     }
 
     let bytes = response.bytes().await?;

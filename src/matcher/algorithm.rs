@@ -561,7 +561,7 @@ fn find_segment_boundary(terminus_visits: &[TerminusVisit]) -> Option<usize> {
         .map(|v| v.position_idx)
 }
 
-/// Score a trip using segmented history with greedy monotonic matching
+/// Score a trip using HMM/Viterbi matching on the position history
 fn score_trip_with_segmentation(
     state: &VehicleState,
     trip: &Trip,
@@ -574,30 +574,23 @@ fn score_trip_with_segmentation(
     }
 
     let start_idx = segment_start.unwrap_or(0);
-    // If we have very little history to work with, we can't be confident
     if state.position_history.len() - start_idx < MIN_POSITIONS_FOR_MATCHING {
         return (0.0, false);
     }
 
-    let stop_times = &trip.stop_times;
-
-    // Matched stops: Vec of (stop_index, timestamp_of_visit)
-    // We use the same greedy monotonic logic as in updates.rs
-    let mut matched_stops: Vec<Option<u64>> = vec![None; stop_times.len()];
-    let mut last_matched_sequence_idx = 0;
-
     let history_slice: Vec<_> = state.position_history.iter().skip(start_idx).collect();
 
-    // Need date string for scheduled timestamp calculation.
-    // If not assigned yet, use today in LA.
+    // Run Viterbi matching
+    let viterbi_result = crate::matcher::viterbi::viterbi_score(&history_slice, trip, gtfs);
+
+    if viterbi_result.score == 0.0 {
+        return (0.0, false);
+    }
+
+    // Compute time-conformance on the Viterbi-matched stops
     let date_str = if let Some(d) = &state.assigned_start_date {
         d.clone()
     } else {
-        // Fallback to today
-        // We really want the date of the position timestamps usually, but
-        // for candidate scoring we are usually looking at "now" or recent.
-        // Let's assume the trip runs "today" relative to the vehicle positions.
-        // A better approx is taking the last position timestamp.
         if let Some(last_pos) = history_slice.last() {
             Los_Angeles
                 .timestamp_opt(last_pos.timestamp as i64, 0)
@@ -609,50 +602,6 @@ fn score_trip_with_segmentation(
         }
     };
 
-    for pos in &history_slice {
-        let mut best_match: Option<(usize, u64)> = None;
-        let mut best_dist = 100.0; // Max radius matches updates.rs logic approximately
-
-        // Search lookahead
-        let search_end = (last_matched_sequence_idx + 10).min(stop_times.len());
-
-        for idx in last_matched_sequence_idx..search_end {
-            let st = &stop_times[idx];
-            if let Some(stop) = gtfs.stops.get(&st.stop_id) {
-                let dist = haversine_distance(pos.lat, pos.lon, stop.lat, stop.lon);
-                // 80 meters radius, consistent with typical bus stop radius
-                if dist < 80.0 && dist < best_dist {
-                    best_match = Some((idx, pos.timestamp));
-                    best_dist = dist;
-                }
-            }
-        }
-
-        if let Some((idx, ts)) = best_match {
-            if idx >= last_matched_sequence_idx {
-                last_matched_sequence_idx = idx;
-                // Capture the FIRST time we hit this stop in the sequence (arrival)
-                if matched_stops[idx].is_none() {
-                    matched_stops[idx] = Some(ts);
-                }
-            }
-        }
-    }
-
-    let unique_stops_matched = matched_stops.iter().filter(|m| m.is_some()).count();
-
-    if unique_stops_matched == 0 {
-        return (0.0, false);
-    }
-
-    // Calculate time conformance
-    let mut total_delta_sum = 0.0;
-    let mut delta_count = 0;
-    let mut weighted_score_sum = 0.0;
-    let mut total_weight = 0.0;
-
-    // Helper to get scheduled timestamp
-    // We duplicate the logic from updates.rs effectively here since it's small
     let get_sched_ts = |secs: u32| -> Option<i64> {
         use chrono::NaiveDate;
         if let Ok(date) = NaiveDate::parse_from_str(&date_str, "%Y%m%d") {
@@ -666,7 +615,12 @@ fn score_trip_with_segmentation(
         None
     };
 
+    let stop_times = &trip.stop_times;
+    let matched_stops = &viterbi_result.matched_stops;
     let latest_timestamp = history_slice.last().map(|p| p.timestamp).unwrap_or(0);
+
+    let mut weighted_score_sum = 0.0;
+    let mut total_weight = 0.0;
 
     for (idx, ts_opt) in matched_stops.iter().enumerate() {
         if let Some(actual_ts) = ts_opt {
@@ -675,10 +629,6 @@ fn score_trip_with_segmentation(
                 if let Some(sched_ts) = get_sched_ts(sched_secs) {
                     let delta = *actual_ts as i64 - sched_ts;
 
-                    total_delta_sum += delta as f64;
-                    delta_count += 1;
-
-                    // Recency weight
                     let seconds_ago = if latest_timestamp > *actual_ts {
                         latest_timestamp - *actual_ts
                     } else {
@@ -693,18 +643,6 @@ fn score_trip_with_segmentation(
                         0.2
                     };
 
-                    // Time Match Score
-                    // Similar logic to previous:
-                    // -5m to +10m: Good
-                    // -10m to +20m: Okay
-                    // -20m to +30m: Poor
-                    // Time Match Score
-                    // Adjusted to favor late trips (positive delta) to pick earlier trip IDs
-                    // -5m to +10m: Good (1.0)
-                    // +10m to +30m: Late but acceptable (0.8)
-                    // +30m to +60m: Very late (0.6)
-                    // > +60m: Poor (0.1)
-                    // Early (< -5m): Penalized more heavily to avoid picking future trips
                     let ts_score = if delta >= -300 && delta <= 600 {
                         1.0
                     } else if delta > 600 && delta <= 1800 {
@@ -716,7 +654,7 @@ fn score_trip_with_segmentation(
                     } else if delta >= -600 && delta < -300 {
                         0.5
                     } else if delta < -600 {
-                        0.0 // Don't match if very early (likely wrong trip)
+                        0.0
                     } else {
                         0.0
                     };
@@ -728,53 +666,14 @@ fn score_trip_with_segmentation(
         }
     }
 
-    // Excessive delay check - LOGGING ONLY, NO DISQUALIFICATION
-    if delta_count > 0 {
-        let avg_delta = total_delta_sum / delta_count as f64;
-        // Strictly penalize trips that are on average > 30 mins late or > 30 mins early
-        if avg_delta.abs() > 1800.0 {
-            println!(
-                "Trip {} has excessive average delay: {:.1}s. Debugging details:",
-                trip.trip_id, avg_delta
-            );
-
-            let mut logged = 0;
-            for (idx, ts_opt) in matched_stops.iter().enumerate() {
-                if let Some(actual_ts) = ts_opt {
-                    if logged < 5 {
-                        let st = &stop_times[idx];
-                        if let Some(sched_secs) = st.arrival_time_secs {
-                            if let Some(sched_ts) = get_sched_ts(sched_secs) {
-                                println!(
-                                    "  Stop {}: Sched {} (secs={}), Actual {}, Delta {}",
-                                    st.stop_id,
-                                    sched_ts,
-                                    sched_secs,
-                                    actual_ts,
-                                    *actual_ts as i64 - sched_ts
-                                );
-                            }
-                        }
-                        logged += 1;
-                    }
-                }
-            }
-        }
-    }
-
     let avg_time_score = if total_weight > 0.0 {
         weighted_score_sum / total_weight
     } else {
-        0.0 // No valid time comparisons means we can't verify this trip
+        0.0
     };
 
-    let coverage = unique_stops_matched as f64 / stop_times.len() as f64;
-
-    // Check for transition signature using existing helper
     let transition_detected = detect_transition_signature(state, trip, gtfs, terminus_visits);
 
-    // Consider early stop presence in recent history
-    // We can check if matched_stops contain early indices
     let has_early_stops = matched_stops
         .iter()
         .enumerate()
@@ -785,11 +684,8 @@ fn score_trip_with_segmentation(
         1.0
     };
 
-    // Calculate final score
-    let raw_score = (unique_stops_matched as f64).sqrt()
-        * avg_time_score
-        * (0.3 + 0.7 * coverage)
-        * early_bonus;
+    // Combine Viterbi spatial score with time conformance
+    let raw_score = viterbi_result.score * avg_time_score * early_bonus;
 
     (raw_score.min(1.0), transition_detected)
 }

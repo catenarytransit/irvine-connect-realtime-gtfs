@@ -20,7 +20,6 @@ struct ProxyManager {
 impl ProxyManager {
     async fn new(proxy_url: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut clients = Vec::new();
-        // Add direct connection as fallback
         clients.push(reqwest::Client::new());
 
         let fallback_client = reqwest::Client::new();
@@ -130,7 +129,6 @@ async fn fetch_and_process(
     let response = match response_result {
         Ok(res) => res,
         Err(e) => {
-            // If the connection failed completely, also rotate
             proxy_manager.rotate_client();
             return Err(e.into());
         }
@@ -140,8 +138,6 @@ async fn fetch_and_process(
         proxy_manager.rotate_client();
         return Err("429 Too Many Requests, rotating proxy".into());
     } else if !response.status().is_success() {
-        // We might also want to rotate on 403 or 500s sometimes from bad proxies,
-        // but let's strictly follow rotating when needed or just pass the error
         let status = response.status();
         return Err(format!("HTTP Error: {}", status).into());
     }

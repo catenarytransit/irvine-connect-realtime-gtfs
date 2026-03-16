@@ -94,10 +94,13 @@ pub async fn run_fetcher(
         )
         .await
         {
+            let mut should_skip_sleep = false;
+
             Ok(count) => {
                 println!("Processed {} vehicles", count);
             }
             Err(e) => {
+                should_skip_sleep = true;
                 eprintln!("Fetch error: {}", e);
             }
         }
@@ -112,7 +115,9 @@ pub async fn run_fetcher(
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(FETCH_INTERVAL_MS)).await;
+        if !should_skip_sleep {
+            tokio::time::sleep(Duration::from_millis(FETCH_INTERVAL_MS)).await;
+        }
     }
 }
 

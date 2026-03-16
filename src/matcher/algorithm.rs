@@ -580,14 +580,6 @@ fn score_trip_with_segmentation(
 
     let history_slice: Vec<_> = state.position_history.iter().skip(start_idx).collect();
 
-    // Run Viterbi matching
-    let viterbi_result = crate::matcher::viterbi::viterbi_score(&history_slice, trip, gtfs);
-
-    if viterbi_result.score == 0.0 {
-        return (0.0, false);
-    }
-
-    // Compute time-conformance on the Viterbi-matched stops
     let date_str = if let Some(d) = &state.assigned_start_date {
         d.clone()
     } else {
@@ -601,6 +593,16 @@ fn score_trip_with_segmentation(
             "20240101".to_string()
         }
     };
+
+    // Run Viterbi matching
+    let viterbi_result =
+        crate::matcher::viterbi::viterbi_score(&history_slice, trip, gtfs, &date_str);
+
+    if viterbi_result.score == 0.0 {
+        return (0.0, false);
+    }
+
+
 
     let get_sched_ts = |secs: u32| -> Option<i64> {
         use chrono::NaiveDate;

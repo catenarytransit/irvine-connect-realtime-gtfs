@@ -95,7 +95,8 @@ fn generate_single_trip_update(
 
     // Run Viterbi matching on position history
     let history_slice: Vec<_> = state.position_history.iter().collect();
-    let viterbi_result = crate::matcher::viterbi::viterbi_score(&history_slice, trip, gtfs);
+    let viterbi_result =
+        crate::matcher::viterbi::viterbi_score(&history_slice, trip, gtfs, date_str);
     let matched_stops = viterbi_result.matched_stops;
 
     // Find the last visited stop and calculate its delay

@@ -139,8 +139,8 @@ async fn fetch_and_process(
         return Err("429 Too Many Requests, rotating proxy".into());
     } else if !response.status().is_success() {
         let status = response.status();
-        return Err(format!("HTTP Error: {}", status).into());
         proxy_manager.rotate_client();
+        return Err(format!("HTTP Error: {}", status).into());
     }
 
     let bytes = response.bytes().await?;

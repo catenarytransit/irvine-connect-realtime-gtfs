@@ -1,16 +1,19 @@
+use crate::matcher::VehicleStateManager;
 use axum::{
     Router,
     http::{StatusCode, header},
-    response::IntoResponse,
+    response::{IntoResponse, Json},
     routing::get,
 };
 use prost::Message;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tower_http::cors::CorsLayer;
 
 pub async fn run_server(
     current_feed: Arc<RwLock<Option<gtfs_realtime::FeedMessage>>>,
     trip_updates_feed: Arc<RwLock<Option<gtfs_realtime::FeedMessage>>>,
+    vehicle_states: Arc<RwLock<VehicleStateManager>>,
     port: u16,
 ) {
     let app = Router::new()
@@ -28,13 +31,36 @@ pub async fn run_server(
                 move || get_feed(feed.clone())
             }),
         )
-        .route("/health", get(health_check));
+        .route(
+            "/debug/state",
+            get({
+                let states = vehicle_states.clone();
+                move || get_debug_state(states.clone())
+            }),
+        )
+        .route("/health", get(health_check))
+        .layer(CorsLayer::permissive());
 
     let addr = format!("0.0.0.0:{}", port);
     println!("Starting HTTP server on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Failed to bind to {}: {}", addr, e);
+            return;
+        }
+    };
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("API server failed: {}", e);
+    }
+}
+
+async fn get_debug_state(states: Arc<RwLock<VehicleStateManager>>) -> impl IntoResponse {
+    let states_lock = states.read().await;
+    // Collect states into a vec to easily return as JSON
+    let all_states: Vec<_> = states_lock.all_states().cloned().collect();
+    Json(all_states)
 }
 
 async fn get_feed(feed: Arc<RwLock<Option<gtfs_realtime::FeedMessage>>>) -> impl IntoResponse {

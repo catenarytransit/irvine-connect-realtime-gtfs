@@ -33,6 +33,8 @@ pub struct VehicleState {
     pub previous_trip_id: Option<String>,
     /// Timestamp when we last detected departure from terminus
     pub last_terminus_departure: Option<u64>,
+    #[serde(default)]
+    pub debug_trip_candidates: Vec<(String, f64)>,
 }
 
 impl VehicleState {
@@ -51,6 +53,7 @@ impl VehicleState {
             last_stop_visit_time: 0,
             previous_trip_id: None,
             last_terminus_departure: None,
+            debug_trip_candidates: Vec::new(),
         }
     }
 

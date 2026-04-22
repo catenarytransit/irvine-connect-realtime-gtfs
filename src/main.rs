@@ -62,13 +62,11 @@ async fn main() {
 
     let api_feed = current_feed.clone();
     let api_tu_feed = trip_updates_feed.clone();
+    let api_states = vehicle_states.clone();
     let port = args.port;
     let api_handle = tokio::spawn(async move {
-        api::server::run_server(api_feed, api_tu_feed, port).await;
+        api::server::run_server(api_feed, api_tu_feed, api_states, port).await;
     });
 
-    tokio::select! {
-        _ = fetcher_handle => eprintln!("Fetcher task exited"),
-        _ = api_handle => eprintln!("API server exited"),
-    }
+    let _ = tokio::join!(fetcher_handle, api_handle);
 }

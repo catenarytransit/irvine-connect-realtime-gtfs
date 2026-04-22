@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 const REALTIME_URL: &str =
     "https://passio3.com/irvine/passioTransit/gtfs/realtime/vehiclePositions";
-const FETCH_INTERVAL_MS: u64 = 1000;
+const FETCH_INTERVAL_MS: u64 = 500;
 const PROXY_LIST_URL: &str =
     "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/US/data.txt";
 
@@ -87,13 +87,11 @@ pub async fn run_fetcher(
     let mut current_iteration = 0;
 
     loop {
-        let mut should_skip_sleep = false;
-
         let now_utc = Utc::now();
         let current_california_local_time = now_utc.with_timezone(&chrono_tz::America::Los_Angeles);
         let hour: u32 = current_california_local_time.hour();
 
-        if (hour < 5 || hour > 23) {
+        if hour < 5 || hour > 23 {
             match fetch_and_process(
                 &proxy_manager,
                 &gtfs,
@@ -107,7 +105,6 @@ pub async fn run_fetcher(
                     println!("Processed {} vehicles", count);
                 }
                 Err(e) => {
-                    should_skip_sleep = true;
                     eprintln!("Fetch error: {}", e);
                 }
             }
@@ -125,14 +122,13 @@ pub async fn run_fetcher(
                     println!("Processed {} vehicles", count);
                 }
                 Err(e) => {
-                    should_skip_sleep = true;
                     eprintln!("Fetch error: {}", e);
                 }
             }
         }
 
         current_iteration += 1;
-        if current_iteration % 30 == 0 {
+        if current_iteration % 10 == 0 {
             let state_manager = states.read().await;
             if let Err(e) = state_manager.save("vehicle_state.json") {
                 eprintln!("Failed to save vehicle state: {}", e);
@@ -141,9 +137,7 @@ pub async fn run_fetcher(
             }
         }
 
-        if !should_skip_sleep {
-            tokio::time::sleep(Duration::from_millis(FETCH_INTERVAL_MS)).await;
-        }
+        tokio::time::sleep(Duration::from_millis(FETCH_INTERVAL_MS)).await;
     }
 }
 

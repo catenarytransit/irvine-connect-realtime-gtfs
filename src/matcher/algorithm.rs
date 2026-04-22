@@ -62,6 +62,7 @@ pub fn perform_global_assignment(
 
     let mut all_matches: Vec<(f64, String, String, String)> = Vec::new();
     let mut fallback_routes = HashMap::new();
+    let mut vehicle_candidates_log: HashMap<String, Vec<(String, f64)>> = HashMap::new();
 
     // First pass: Find candidates for all vehicles
     for vehicle_id in &vehicle_ids {
@@ -69,7 +70,20 @@ pub fn perform_global_assignment(
             continue;
         }
 
-        if let Some(state) = state_manager.get(vehicle_id) {
+        if let Some(state_ref) = state_manager.get(vehicle_id) {
+            let mut state = state_ref.clone();
+
+            // Hide older position history from the algorithm, preserving it only for updates
+            let now_ts = state
+                .position_history
+                .back()
+                .map(|p| p.timestamp)
+                .unwrap_or(0);
+            let cutoff = now_ts
+                .saturating_sub(10 * 60)
+                .max(state.last_terminus_departure.unwrap_or(0));
+            state.position_history.retain(|p| p.timestamp >= cutoff);
+
             if state.position_history.len() < MIN_POSITIONS_FOR_MATCHING {
                 continue;
             }
@@ -117,16 +131,16 @@ pub fn perform_global_assignment(
                 );
 
                 // 1. Find all raw visits to terminus (trip-independent)
-                let raw_terminus_visits = find_raw_terminus_visits(state);
+                let raw_terminus_visits = find_raw_terminus_visits(&state);
 
                 for trip in &candidates {
                     // Classify visits specific to THIS trip
                     let terminus_visits =
-                        classify_terminus_visits_for_trip(state, trip, &raw_terminus_visits, gtfs);
+                        classify_terminus_visits_for_trip(&state, trip, &raw_terminus_visits, gtfs);
                     let segment_start = find_segment_boundary(&terminus_visits);
 
                     let (mut score, transition_detected) = score_trip_with_segmentation(
-                        state,
+                        &state,
                         trip,
                         gtfs,
                         segment_start,
@@ -155,8 +169,12 @@ pub fn perform_global_assignment(
 
                         // Penalize previous trip in block if we see early stops of next trip
                         if let Some(next_in_block) = gtfs.get_next_trip_in_block(&trip.trip_id) {
-                            if history_shows_early_stops(state, &next_in_block, gtfs, segment_start)
-                            {
+                            if history_shows_early_stops(
+                                &state,
+                                &next_in_block,
+                                gtfs,
+                                segment_start,
+                            ) {
                                 println!(
                                     "Vehicle {} - Penalizing {} (history shows next trip {})",
                                     vehicle_id, trip.trip_id, next_in_block.trip_id
@@ -211,6 +229,11 @@ pub fn perform_global_assignment(
                             trip.trip_id.clone(),
                             service_date,
                         ));
+
+                        vehicle_candidates_log
+                            .entry(vehicle_id.clone())
+                            .or_default()
+                            .push((trip.trip_id.clone(), score));
 
                         // Store route hint
                         let route_hint = trip.route_id.clone();
@@ -417,6 +440,10 @@ pub fn perform_global_assignment(
         // Apply assignments
         for vehicle_id in &vehicle_ids {
             if let Some(state) = state_manager.get_mut(vehicle_id) {
+                state.debug_trip_candidates = vehicle_candidates_log
+                    .remove(vehicle_id)
+                    .unwrap_or_default();
+
                 if let Some((trip_id, route_id, start_date, score)) =
                     final_assignments.get(vehicle_id)
                 {

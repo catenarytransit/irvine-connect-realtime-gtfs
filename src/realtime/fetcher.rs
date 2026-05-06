@@ -92,22 +92,9 @@ pub async fn run_fetcher(
         let hour: u32 = current_california_local_time.hour();
 
         if hour < 5 || hour > 23 {
-            match fetch_and_process(
-                &proxy_manager,
-                &gtfs,
-                &states,
-                &current_feed,
-                &trip_updates_feed,
-            )
-            .await
-            {
-                Ok(count) => {
-                    println!("Processed {} vehicles", count);
-                }
-                Err(e) => {
-                    eprintln!("Fetch error: {}", e);
-                }
-            }
+            //dont do anything this early
+
+            tokio::time::sleep(Duration::from_millis(10000)).await;
         } else {
             match fetch_and_process(
                 &proxy_manager,

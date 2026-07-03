@@ -19,3 +19,4 @@ serde_json = "1.0"
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.8"
 tower-http = { version = "0.6.8", features = ["cors"] }
+tikv-jemallocator = "0.7.0"

@@ -93,11 +93,12 @@ fn generate_single_trip_update(
         ..Default::default()
     });
 
-    // Run Viterbi matching on position history
-    let history_slice: Vec<_> = state.position_history.iter().collect();
-    let viterbi_result =
-        crate::matcher::viterbi::viterbi_score(&history_slice, trip, gtfs, date_str);
-    let matched_stops = viterbi_result.matched_stops;
+    // Reuse the winning Viterbi result cached during global assignment.
+    // This avoids a second full-history Viterbi pass for every assigned vehicle.
+    let matched_stops = &state.matched_stop_timestamps;
+    if matched_stops.len() != stop_times.len() {
+        return None;
+    }
 
     // Find the last visited stop and calculate its delay
     let mut last_visited_idx: Option<usize> = None;

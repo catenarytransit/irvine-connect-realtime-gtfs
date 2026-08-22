@@ -40,26 +40,22 @@ pub async fn load_gtfs() -> Result<GtfsData, Box<dyn std::error::Error + Send + 
             .or_default()
             .push(idx);
 
-        trips.push(Trip {
-            trip_id,
-            route_id,
-            service_id,
-            block_id,
-            stop_times,
-        });
+        trips.push(Trip::new(
+            trip_id, route_id, service_id, block_id, stop_times, &stops,
+        ));
     }
 
     for indices in trips_by_block.values_mut() {
         indices.sort_by_key(|&i| trips[i].start_time_minutes().unwrap_or(0));
     }
 
-    Ok(GtfsData {
+    Ok(GtfsData::new(
         stops,
         trips,
         trips_by_block,
         weekday_trips,
         weekend_trips,
-    })
+    ))
 }
 
 fn parse_stops(

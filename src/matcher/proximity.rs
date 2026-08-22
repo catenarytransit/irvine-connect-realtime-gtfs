@@ -1,4 +1,4 @@
-use crate::gtfs::GtfsData;
+use crate::gtfs::Trip;
 
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
 const STOP_RADIUS_METERS: f64 = 50.0;
@@ -16,21 +16,14 @@ pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     EARTH_RADIUS_M * c
 }
 
-pub fn find_nearest_stop_on_trip(
-    lat: f64,
-    lon: f64,
-    trip_stop_ids: &[String],
-    gtfs: &GtfsData,
-) -> Option<(usize, String, f64)> {
-    let mut best: Option<(usize, String, f64)> = None;
+pub fn find_nearest_stop_on_trip(lat: f64, lon: f64, trip: &Trip) -> Option<(usize, f64)> {
+    let mut best: Option<(usize, f64)> = None;
 
-    for (idx, stop_id) in trip_stop_ids.iter().enumerate() {
-        if let Some(stop) = gtfs.stops.get(stop_id) {
-            let dist = haversine_distance(lat, lon, stop.lat, stop.lon);
-            if dist <= STOP_RADIUS_METERS {
-                if best.as_ref().map_or(true, |(_, _, d)| dist < *d) {
-                    best = Some((idx, stop_id.clone(), dist));
-                }
+    for (idx, coords) in trip.stop_coords.iter().enumerate() {
+        if let Some((stop_lat, stop_lon)) = coords {
+            let dist = haversine_distance(lat, lon, *stop_lat, *stop_lon);
+            if dist <= STOP_RADIUS_METERS && best.as_ref().map_or(true, |(_, d)| dist < *d) {
+                best = Some((idx, dist));
             }
         }
     }
@@ -82,16 +75,4 @@ pub fn cross_track_distance(
 
     let dist = haversine_distance(lat, lon, proj_lat.to_degrees(), proj_lon.to_degrees());
     (dist, t_clamped)
-}
-
-/// Gaussian emission probability: how likely GPS point was generated at distance `d` from a stop.
-pub fn emission_probability(distance_meters: f64, sigma_z: f64) -> f64 {
-    let normalization = 1.0 / ((2.0 * std::f64::consts::PI).sqrt() * sigma_z);
-    normalization * (-distance_meters * distance_meters / (2.0 * sigma_z * sigma_z)).exp()
-}
-
-/// Exponential transition probability penalizing route/euclidean distance mismatch.
-pub fn transition_probability(d_route: f64, d_euclidean: f64, beta: f64) -> f64 {
-    let diff = (d_route - d_euclidean).abs();
-    (-diff / beta).exp() / beta
 }

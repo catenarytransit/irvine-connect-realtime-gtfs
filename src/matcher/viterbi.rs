@@ -1,6 +1,6 @@
-use crate::gtfs::{GtfsData, Trip};
+use crate::gtfs::Trip;
 use crate::matcher::history::TimestampedPosition;
-use crate::matcher::proximity::{emission_probability, haversine_distance, transition_probability};
+use crate::matcher::proximity::haversine_distance;
 use chrono::TimeDelta;
 use chrono::TimeZone;
 use chrono_tz::America::Los_Angeles;
@@ -19,31 +19,12 @@ pub struct ViterbiResult {
     pub matched_stops: Vec<Option<u64>>,
 }
 
-fn build_cumulative_distances(trip: &Trip, gtfs: &GtfsData) -> Vec<f64> {
-    let mut cumulative = vec![0.0; trip.stop_times.len()];
-
-    for i in 1..trip.stop_times.len() {
-        let prev_id = &trip.stop_times[i - 1].stop_id;
-        let curr_id = &trip.stop_times[i].stop_id;
-
-        let seg_dist = match (gtfs.stops.get(prev_id), gtfs.stops.get(curr_id)) {
-            (Some(a), Some(b)) => haversine_distance(a.lat, a.lon, b.lat, b.lon),
-            _ => 0.0,
-        };
-
-        cumulative[i] = cumulative[i - 1] + seg_dist;
-    }
-
-    cumulative
-}
-
 fn route_distance(cumulative: &[f64], from: usize, to: usize) -> f64 {
     if to >= from {
         cumulative[to] - cumulative[from]
     } else {
         // Backward transitions: return a distance so large that
-        // |d_route - d_euclidean| produces a massive penalty in the
-        // exponential transition probability.
+        // |d_route - d_euclidean| produces a massive penalty.
         1.0e6
     }
 }
@@ -79,59 +60,56 @@ fn temporal_log_penalty(gps_ts: u64, sched_secs: Option<u32>, base_ts: Option<i6
 pub fn viterbi_score(
     positions: &[&TimestampedPosition],
     trip: &Trip,
-    gtfs: &GtfsData,
     date_str: &str,
 ) -> ViterbiResult {
-    let empty = ViterbiResult {
+    let empty = || ViterbiResult {
         score: 0.0,
         matched_stops: vec![None; trip.stop_times.len()],
     };
 
     let num_stops = trip.stop_times.len();
     if positions.is_empty() || num_stops == 0 {
-        return empty;
+        return empty();
     }
 
-    let cumulative = build_cumulative_distances(trip, gtfs);
     let base_ts = service_day_base(date_str);
+    let stop_coords = &trip.stop_coords;
+    let cumulative = &trip.cumulative_distances;
 
-    let stop_coords: Vec<Option<(f64, f64)>> = trip
-        .stop_times
-        .iter()
-        .map(|st| gtfs.stops.get(&st.stop_id).map(|s| (s.lat, s.lon)))
-        .collect();
+    // Viterbi already works in log space. Compute the Gaussian/exponential
+    // normalizers once and avoid exp(x).ln() in the innermost loops.
+    let log_emission_normalizer = -((2.0 * std::f64::consts::PI).sqrt() * GPS_SIGMA_Z).ln();
+    let inv_two_sigma_sq = 1.0 / (2.0 * GPS_SIGMA_Z * GPS_SIGMA_Z);
+    let log_transition_normalizer = -TRANSITION_BETA.ln();
+    let inv_transition_beta = 1.0 / TRANSITION_BETA;
 
-    let mut prev_log_prob: Vec<f64> = vec![f64::NEG_INFINITY; num_stops];
-    let mut best_path: Vec<Vec<usize>> = vec![Vec::new(); num_stops];
-    let mut window_center: usize = 0;
+    let mut prev_log_prob = vec![f64::NEG_INFINITY; num_stops];
+    let mut curr_log_prob = vec![f64::NEG_INFINITY; num_stops];
+
+    // One predecessor per (observation, stop-state). This is O(P*S) compact
+    // storage instead of cloning an O(P) path for every active state at every
+    // observation, which made the old implementation O(W*P^2) in path copies.
+    let mut backpointers = vec![usize::MAX; positions.len() * num_stops];
+    let mut window_center = 0usize;
 
     // === Initialization ===
     let first_pos = positions[0];
     let mut init_best_j = 0;
     let mut init_best_log = f64::NEG_INFINITY;
-
-    let lo = 0;
     let hi = num_stops.min(STATE_WINDOW * 2);
 
-    for j in lo..hi {
+    for j in 0..hi {
         if let Some((slat, slon)) = stop_coords[j] {
             let dist = haversine_distance(first_pos.lat, first_pos.lon, slat, slon);
-            let ep = emission_probability(dist, GPS_SIGMA_Z);
-            let log_ep = if ep > 0.0 {
-                ep.ln().max(MIN_EMISSION_LOG)
-            } else {
-                MIN_EMISSION_LOG
-            };
-
+            let log_ep =
+                (log_emission_normalizer - dist * dist * inv_two_sigma_sq).max(MIN_EMISSION_LOG);
             let time_pen = temporal_log_penalty(
                 first_pos.timestamp,
                 trip.stop_times[j].arrival_time_secs,
                 base_ts,
             );
-
             let total = log_ep + time_pen;
             prev_log_prob[j] = total;
-            best_path[j] = vec![j];
 
             if total > init_best_log {
                 init_best_log = total;
@@ -150,9 +128,9 @@ pub fn viterbi_score(
 
         let gps_dlat = pos.lat - prev_pos.lat;
         let gps_dlon = pos.lon - prev_pos.lon;
+        let gps_mag = (gps_dlat * gps_dlat + gps_dlon * gps_dlon).sqrt();
 
-        let mut curr_log_prob: Vec<f64> = vec![f64::NEG_INFINITY; num_stops];
-        let mut curr_path: Vec<Vec<usize>> = vec![Vec::new(); num_stops];
+        curr_log_prob.fill(f64::NEG_INFINITY);
         let mut step_best_j = window_center;
         let mut step_best_log = f64::NEG_INFINITY;
 
@@ -166,34 +144,24 @@ pub fn viterbi_score(
             };
 
             let dist = haversine_distance(pos.lat, pos.lon, slat, slon);
-            let ep = emission_probability(dist, GPS_SIGMA_Z);
-            let log_ep = if ep > 0.0 {
-                ep.ln().max(MIN_EMISSION_LOG)
-            } else {
-                MIN_EMISSION_LOG
-            };
-
+            let log_ep =
+                (log_emission_normalizer - dist * dist * inv_two_sigma_sq).max(MIN_EMISSION_LOG);
             let time_pen =
                 temporal_log_penalty(pos.timestamp, trip.stop_times[j].arrival_time_secs, base_ts);
 
-            let i_lo = j_lo;
             let i_hi = (j + 1).min(j_hi);
-
             let mut best_prev_log = f64::NEG_INFINITY;
             let mut best_prev_i = j;
 
-            for i in i_lo..i_hi {
+            for i in j_lo..i_hi {
                 if prev_log_prob[i] == f64::NEG_INFINITY {
                     continue;
                 }
 
-                let d_route = route_distance(&cumulative, i, j);
-                let tp = transition_probability(d_route, d_euclidean, TRANSITION_BETA);
-                let log_tp = if tp > 0.0 {
-                    tp.ln().max(MIN_EMISSION_LOG)
-                } else {
-                    MIN_EMISSION_LOG
-                };
+                let d_route = route_distance(cumulative, i, j);
+                let log_tp = (log_transition_normalizer
+                    - (d_route - d_euclidean).abs() * inv_transition_beta)
+                    .max(MIN_EMISSION_LOG);
 
                 // Velocity vector consistency
                 let dir_log = if i != j {
@@ -203,7 +171,6 @@ pub fn viterbi_score(
                         let route_dlat = j_lat - i_lat;
                         let route_dlon = j_lon - i_lon;
                         let dot = gps_dlat * route_dlat + gps_dlon * route_dlon;
-                        let gps_mag = (gps_dlat * gps_dlat + gps_dlon * gps_dlon).sqrt();
                         let route_mag = (route_dlat * route_dlat + route_dlon * route_dlon).sqrt();
 
                         if gps_mag > 1e-9 && route_mag > 1e-9 {
@@ -229,10 +196,7 @@ pub fn viterbi_score(
 
             let total = best_prev_log + log_ep + time_pen;
             curr_log_prob[j] = total;
-
-            let mut path = best_path[best_prev_i].clone();
-            path.push(j);
-            curr_path[j] = path;
+            backpointers[t * num_stops + j] = best_prev_i;
 
             if total > step_best_log {
                 step_best_log = total;
@@ -240,8 +204,7 @@ pub fn viterbi_score(
             }
         }
 
-        prev_log_prob = curr_log_prob;
-        best_path = curr_path;
+        std::mem::swap(&mut prev_log_prob, &mut curr_log_prob);
         window_center = step_best_j;
     }
 
@@ -249,31 +212,40 @@ pub fn viterbi_score(
     let mut best_final_j = 0;
     let mut best_final_log = f64::NEG_INFINITY;
 
-    for j in 0..num_stops {
-        if prev_log_prob[j] > best_final_log {
-            best_final_log = prev_log_prob[j];
+    for (j, &log_prob) in prev_log_prob.iter().enumerate() {
+        if log_prob > best_final_log {
+            best_final_log = log_prob;
             best_final_j = j;
         }
     }
 
     if best_final_log == f64::NEG_INFINITY {
-        return empty;
+        return empty();
     }
 
     // === Traceback ===
-    let winning_path = &best_path[best_final_j];
+    let mut winning_path = vec![0usize; positions.len()];
+    winning_path[positions.len() - 1] = best_final_j;
+
+    for t in (1..positions.len()).rev() {
+        let current = winning_path[t];
+        let previous = backpointers[t * num_stops + current];
+        if previous == usize::MAX {
+            return empty();
+        }
+        winning_path[t - 1] = previous;
+    }
 
     let mut matched_stops: Vec<Option<u64>> = vec![None; num_stops];
-
     for (obs_idx, &stop_idx) in winning_path.iter().enumerate() {
-        if obs_idx < positions.len() && matched_stops[stop_idx].is_none() {
+        if matched_stops[stop_idx].is_none() {
             matched_stops[stop_idx] = Some(positions[obs_idx].timestamp);
         }
     }
 
     let unique_matched = matched_stops.iter().filter(|m| m.is_some()).count();
     if unique_matched == 0 {
-        return empty;
+        return empty();
     }
 
     let coverage = unique_matched as f64 / num_stops as f64;

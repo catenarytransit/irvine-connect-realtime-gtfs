@@ -35,6 +35,10 @@ pub struct VehicleState {
     pub last_terminus_departure: Option<u64>,
     #[serde(default)]
     pub debug_trip_candidates: Vec<(String, f64)>,
+    /// Cached stop timestamps from the winning Viterbi path for the assigned trip.
+    /// Trip-update generation consumes this instead of rerunning Viterbi.
+    #[serde(default)]
+    pub matched_stop_timestamps: Vec<Option<u64>>,
 }
 
 impl VehicleState {
@@ -54,10 +58,26 @@ impl VehicleState {
             previous_trip_id: None,
             last_terminus_departure: None,
             debug_trip_candidates: Vec::new(),
+            matched_stop_timestamps: Vec::new(),
         }
     }
 
-    pub fn add_position(&mut self, lat: f64, lon: f64, bearing: Option<f32>, timestamp: u64) {
+    pub fn add_position(
+        &mut self,
+        lat: f64,
+        lon: f64,
+        bearing: Option<f32>,
+        timestamp: u64,
+    ) -> bool {
+        if self.position_history.back().map_or(false, |last| {
+            last.timestamp == timestamp
+                && last.lat == lat
+                && last.lon == lon
+                && last.bearing == bearing
+        }) {
+            return false;
+        }
+
         self.position_history.push_back(TimestampedPosition {
             lat,
             lon,
@@ -78,6 +98,8 @@ impl VehicleState {
         {
             self.position_history.pop_front();
         }
+
+        true
     }
 
     pub fn record_stop_visit(&mut self, stop_id: &str, timestamp: u64) {
@@ -101,6 +123,7 @@ impl VehicleState {
         self.assigned_start_date = None;
         self.route_id = None;
         self.trip_confidence = 0.0;
+        self.matched_stop_timestamps.clear();
     }
 
     /// Called when we detect the vehicle has departed terminus on a new trip.
@@ -111,9 +134,33 @@ impl VehicleState {
         self.last_terminus_departure = Some(departure_timestamp);
         self.visited_stops.clear();
         self.stop_visit_timestamps.clear();
+        self.matched_stop_timestamps.clear();
         // route_id will be updated by the next assignment loop if needed,
         // but ideally we should set it here if we knew it.
         // For now, the global assignment loop will handle setting route_id.
+    }
+
+    pub fn replace_matched_stops(&mut self, matched_stops: &[Option<u64>]) {
+        self.matched_stop_timestamps.clear();
+        self.matched_stop_timestamps
+            .extend_from_slice(matched_stops);
+    }
+
+    pub fn merge_matched_stops(&mut self, matched_stops: &[Option<u64>]) {
+        if self.matched_stop_timestamps.len() != matched_stops.len() {
+            self.replace_matched_stops(matched_stops);
+            return;
+        }
+
+        for (cached, new_match) in self
+            .matched_stop_timestamps
+            .iter_mut()
+            .zip(matched_stops.iter())
+        {
+            if cached.is_none() {
+                *cached = *new_match;
+            }
+        }
     }
 
     /// Clear position history entirely (use when transitioning between blocks or long gaps)

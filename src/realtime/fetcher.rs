@@ -172,7 +172,12 @@ async fn fetch_and_process(
     {
         let mut state_manager = states.write().await;
 
-        // Pass 1: Update positions and stops for all vehicles
+        // Pass 1: Update positions and stops for all vehicles.
+        // Exact duplicate snapshots are ignored so a repeated upstream feed does not
+        // trigger another full global match.
+        let mut any_position_changed = state_manager.all_states().any(|state| {
+            state.assigned_trip_id.is_some() && state.matched_stop_timestamps.is_empty()
+        });
         for entity in &feed.entity {
             if let Some(vehicle) = &entity.vehicle {
                 if let Some(position) = &vehicle.position {
@@ -192,7 +197,7 @@ async fn fetch_and_process(
                         state.source_id = source_id;
                     }
 
-                    algorithm::update_vehicle_state(
+                    any_position_changed |= algorithm::update_vehicle_state(
                         state,
                         position.latitude as f64,
                         position.longitude as f64,
@@ -204,8 +209,10 @@ async fn fetch_and_process(
             }
         }
 
-        // Pass 2: Perform global assignment
-        algorithm::perform_global_assignment(&mut state_manager, gtfs);
+        // Pass 2: Perform global assignment only when at least one observation changed.
+        if any_position_changed {
+            algorithm::perform_global_assignment(&mut state_manager, gtfs);
+        }
 
         // Pass 3: Construct new feed entities with assigned trips
         for entity in &feed.entity {

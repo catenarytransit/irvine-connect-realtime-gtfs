@@ -40,6 +40,22 @@ struct RawTerminusVisit {
     timestamp: u64,
 }
 
+struct CandidateMatch {
+    score: f64,
+    vehicle_id: String,
+    trip_id: String,
+    service_date: String,
+    matched_stops: Vec<Option<u64>>,
+}
+
+struct FinalAssignment {
+    trip_id: String,
+    route_id: Option<String>,
+    start_date: String,
+    score: f64,
+    matched_stops: Vec<Option<u64>>,
+}
+
 pub fn update_vehicle_state(
     state: &mut VehicleState,
     lat: f64,
@@ -47,8 +63,8 @@ pub fn update_vehicle_state(
     bearing: Option<f32>,
     timestamp: u64,
     _gtfs: &GtfsData,
-) {
-    state.add_position(lat, lon, bearing, timestamp);
+) -> bool {
+    state.add_position(lat, lon, bearing, timestamp)
 }
 
 pub fn perform_global_assignment(
@@ -60,7 +76,7 @@ pub fn perform_global_assignment(
         .map(|s| s.vehicle_id.clone())
         .collect();
 
-    let mut all_matches: Vec<(f64, String, String, String)> = Vec::new();
+    let mut all_matches: Vec<CandidateMatch> = Vec::new();
     let mut fallback_routes = HashMap::new();
     let mut vehicle_candidates_log: HashMap<String, Vec<(String, f64)>> = HashMap::new();
 
@@ -136,16 +152,11 @@ pub fn perform_global_assignment(
                 for trip in &candidates {
                     // Classify visits specific to THIS trip
                     let terminus_visits =
-                        classify_terminus_visits_for_trip(&state, trip, &raw_terminus_visits, gtfs);
+                        classify_terminus_visits_for_trip(&state, trip, &raw_terminus_visits);
                     let segment_start = find_segment_boundary(&terminus_visits);
 
-                    let (mut score, transition_detected) = score_trip_with_segmentation(
-                        &state,
-                        trip,
-                        gtfs,
-                        segment_start,
-                        &terminus_visits,
-                    );
+                    let (mut score, transition_detected, matched_stops) =
+                        score_trip_with_segmentation(&state, trip, segment_start, &terminus_visits);
 
                     if score > 0.0 {
                         // Stability bonus for staying on same trip
@@ -169,12 +180,7 @@ pub fn perform_global_assignment(
 
                         // Penalize previous trip in block if we see early stops of next trip
                         if let Some(next_in_block) = gtfs.get_next_trip_in_block(&trip.trip_id) {
-                            if history_shows_early_stops(
-                                &state,
-                                &next_in_block,
-                                gtfs,
-                                segment_start,
-                            ) {
+                            if history_shows_early_stops(&state, &next_in_block, segment_start) {
                                 println!(
                                     "Vehicle {} - Penalizing {} (history shows next trip {})",
                                     vehicle_id, trip.trip_id, next_in_block.trip_id
@@ -223,12 +229,13 @@ pub fn perform_global_assignment(
                             now.format("%Y%m%d").to_string()
                         };
 
-                        all_matches.push((
+                        all_matches.push(CandidateMatch {
                             score,
-                            vehicle_id.clone(),
-                            trip.trip_id.clone(),
+                            vehicle_id: vehicle_id.clone(),
+                            trip_id: trip.trip_id.clone(),
                             service_date,
-                        ));
+                            matched_stops,
+                        });
 
                         vehicle_candidates_log
                             .entry(vehicle_id.clone())
@@ -258,12 +265,13 @@ pub fn perform_global_assignment(
     let mut vehicle_list = Vec::new();
     let mut trip_list = Vec::new();
 
-    for (_, v, t, d) in &all_matches {
+    for candidate in &all_matches {
+        let v = &candidate.vehicle_id;
         if !vehicle_map.contains_key(v) {
             vehicle_map.insert(v.clone(), vehicle_list.len());
             vehicle_list.push(v.clone());
         }
-        let trip_key = (t.clone(), d.clone());
+        let trip_key = (candidate.trip_id.clone(), candidate.service_date.clone());
         if !unique_trips.contains(&trip_key) {
             unique_trips.insert(trip_key.clone());
             trip_map.insert(trip_key.clone(), trip_list.len());
@@ -291,12 +299,14 @@ pub fn perform_global_assignment(
         }
 
         // Edges from Vehicles to Trips
-        for (score, v, t, d) in &all_matches {
-            if let Some(&v_idx) = vehicle_map.get(v) {
-                if let Some(&t_idx) = trip_map.get(&(t.clone(), d.clone())) {
+        for candidate in &all_matches {
+            if let Some(&v_idx) = vehicle_map.get(&candidate.vehicle_id) {
+                if let Some(&t_idx) =
+                    trip_map.get(&(candidate.trip_id.clone(), candidate.service_date.clone()))
+                {
                     // Cost = -(Base + Score) * 1000
                     // Base = 1000 to prioritize assignment count
-                    let cost = -((1000.0 + score) * 1000.0) as i64;
+                    let cost = -((1000.0 + candidate.score) * 1000.0) as i64;
                     mcmf.add_edge(v_idx + 1, num_vehicles + t_idx + 1, 1, cost);
                 }
             }
@@ -316,25 +326,34 @@ pub fn perform_global_assignment(
                     let vehicle_id = &vehicle_list[v_idx];
                     let (trip_id, date) = &trip_list[t_idx];
 
-                    // Find original score
-                    let score = all_matches
-                        .iter()
-                        .find(|(_, v, t, d)| v == vehicle_id && t == trip_id && d == date)
-                        .map(|(s, _, _, _)| *s)
-                        .unwrap_or(0.0);
+                    let candidate = all_matches.iter().find(|candidate| {
+                        candidate.vehicle_id == *vehicle_id
+                            && candidate.trip_id == *trip_id
+                            && candidate.service_date == *date
+                    });
 
-                    if score >= CONFIDENCE_THRESHOLD {
+                    if let Some(candidate) = candidate {
+                        if candidate.score < CONFIDENCE_THRESHOLD {
+                            continue;
+                        }
+
                         assigned_vehicles.insert(vehicle_id.clone());
                         assigned_trips.insert((trip_id.clone(), date.clone()));
                         let route_id = gtfs.get_trip_by_id(trip_id).map(|t| t.route_id.clone());
 
                         final_assignments.insert(
                             vehicle_id.clone(),
-                            (trip_id.clone(), route_id, date.clone(), score),
+                            FinalAssignment {
+                                trip_id: trip_id.clone(),
+                                route_id,
+                                start_date: date.clone(),
+                                score: candidate.score,
+                                matched_stops: candidate.matched_stops.clone(),
+                            },
                         );
                         println!(
                             "Assigned {} to {} (score {:.3}) via MCMF",
-                            vehicle_id, trip_id, score
+                            vehicle_id, trip_id, candidate.score
                         );
                     }
                 }
@@ -369,7 +388,7 @@ pub fn perform_global_assignment(
 
                         if !nearby_stop_ids.is_empty() {
                             let active_trips = gtfs.get_active_trips(is_weekend);
-                            let mut best_fallback: Option<(&Trip, f64)> = None;
+                            let mut best_fallback: Option<(&Trip, f64, Vec<Option<u64>>)> = None;
 
                             for &idx in active_trips {
                                 let trip = &gtfs.trips[idx];
@@ -394,37 +413,35 @@ pub fn perform_global_assignment(
 
                                 if relevant_trip {
                                     let raw_visits = find_raw_terminus_visits(state);
-                                    let visits = classify_terminus_visits_for_trip(
-                                        state,
-                                        trip,
-                                        &raw_visits,
-                                        gtfs,
-                                    );
+                                    let visits =
+                                        classify_terminus_visits_for_trip(state, trip, &raw_visits);
                                     let seg = find_segment_boundary(&visits);
-                                    let (score, _) = score_trip_with_segmentation(
-                                        state, trip, gtfs, seg, &visits,
-                                    );
+                                    let (score, _, matched_stops) =
+                                        score_trip_with_segmentation(state, trip, seg, &visits);
 
-                                    if score > 0.05 {
-                                        if best_fallback.map_or(true, |(_, s)| score > s) {
-                                            best_fallback = Some((trip, score));
-                                        }
+                                    if score > 0.05
+                                        && best_fallback
+                                            .as_ref()
+                                            .map_or(true, |(_, best_score, _)| score > *best_score)
+                                    {
+                                        best_fallback = Some((trip, score, matched_stops));
                                     }
                                 }
                             }
 
-                            if let Some((trip, score)) = best_fallback {
+                            if let Some((trip, score, matched_stops)) = best_fallback {
                                 let date = now.format("%Y%m%d").to_string();
                                 assigned_vehicles.insert(vehicle_id.clone());
                                 assigned_trips.insert((trip.trip_id.clone(), date.clone()));
                                 final_assignments.insert(
                                     vehicle_id.clone(),
-                                    (
-                                        trip.trip_id.clone(),
-                                        Some(trip.route_id.clone()),
-                                        date,
+                                    FinalAssignment {
+                                        trip_id: trip.trip_id.clone(),
+                                        route_id: Some(trip.route_id.clone()),
+                                        start_date: date,
                                         score,
-                                    ),
+                                        matched_stops,
+                                    },
                                 );
                                 println!(
                                     "Fallback assigned {} to {} (score {:.3})",
@@ -444,9 +461,9 @@ pub fn perform_global_assignment(
                     .remove(vehicle_id)
                     .unwrap_or_default();
 
-                if let Some((trip_id, route_id, start_date, score)) =
-                    final_assignments.get(vehicle_id)
-                {
+                if let Some(assignment) = final_assignments.get(vehicle_id) {
+                    let trip_id = &assignment.trip_id;
+                    let is_same_trip = state.assigned_trip_id.as_ref() == Some(trip_id);
                     let is_block_transition =
                         state.assigned_trip_id.as_ref().map_or(false, |curr| {
                             gtfs.get_next_trip_in_block(curr)
@@ -461,18 +478,45 @@ pub fn perform_global_assignment(
                             .map(|p| p.timestamp)
                             .unwrap_or(0);
                         state.transition_to_new_trip(trip_id.as_str(), ts);
-                        state.route_id = route_id.clone();
-                        state.assigned_start_date = Some(start_date.clone());
-                        state.trip_confidence = *score;
-                    } else if state.assigned_trip_id.as_ref() != Some(trip_id) {
+                        state.route_id = assignment.route_id.clone();
+                        state.assigned_start_date = Some(assignment.start_date.clone());
+                        state.trip_confidence = assignment.score;
+                        state.replace_matched_stops(&assignment.matched_stops);
+                    } else if !is_same_trip {
                         state.assigned_trip_id = Some(trip_id.clone());
-                        state.route_id = route_id.clone();
-                        state.assigned_start_date = Some(start_date.clone());
-                        state.trip_confidence = *score;
+                        state.route_id = assignment.route_id.clone();
+                        state.assigned_start_date = Some(assignment.start_date.clone());
+                        state.trip_confidence = assignment.score;
+                        state.replace_matched_stops(&assignment.matched_stops);
                     } else {
-                        state.trip_confidence = *score;
+                        state.trip_confidence = assignment.score;
+
+                        // Existing state files predate the cached matched-stop field. Seed
+                        // it once from the retained history so a restart does not lose
+                        // already-visited stop timestamps. Normal polling only merges the
+                        // winning recent match and never reruns full-history Viterbi.
+                        if state.matched_stop_timestamps.is_empty() {
+                            if let Some(trip) = gtfs.get_trip_by_id(trip_id) {
+                                let full_history_matches = {
+                                    let history_slice: Vec<_> =
+                                        state.position_history.iter().collect();
+                                    crate::matcher::viterbi::viterbi_score(
+                                        &history_slice,
+                                        trip,
+                                        &assignment.start_date,
+                                    )
+                                    .matched_stops
+                                };
+                                state.replace_matched_stops(&full_history_matches);
+                            } else {
+                                state.replace_matched_stops(&assignment.matched_stops);
+                            }
+                        } else {
+                            state.merge_matched_stops(&assignment.matched_stops);
+                        }
+
                         if state.route_id.is_none() {
-                            state.route_id = route_id.clone();
+                            state.route_id = assignment.route_id.clone();
                         }
                     }
                 } else {
@@ -481,6 +525,7 @@ pub fn perform_global_assignment(
                         state.assigned_trip_id = None;
                         state.assigned_start_date = None;
                         state.trip_confidence = 0.0;
+                        state.matched_stop_timestamps.clear();
                         if let Some(r) = fallback_routes.get(vehicle_id) {
                             state.route_id = Some(r.clone());
                         }
@@ -518,18 +563,11 @@ fn classify_terminus_visits_for_trip(
     state: &VehicleState,
     trip: &Trip,
     raw_visits: &[RawTerminusVisit],
-    gtfs: &GtfsData,
 ) -> Vec<TerminusVisit> {
     let mut classified = Vec::new();
 
     // Dynamic threshold: e.g. last 5 stops of the trip
     let late_threshold_idx = trip.stop_times.len().saturating_sub(5);
-
-    let trip_stop_ids: Vec<String> = trip
-        .stop_times
-        .iter()
-        .map(|st| st.stop_id.clone())
-        .collect();
 
     for raw in raw_visits {
         // Look at positions before this terminus visit
@@ -539,10 +577,7 @@ fn classify_terminus_visits_for_trip(
             .take(raw.position_idx)
             .rev()
             .take(5)
-            .filter_map(|pos| {
-                find_nearest_stop_on_trip(pos.lat, pos.lon, &trip_stop_ids, gtfs)
-                    .map(|(idx, _, _)| idx)
-            })
+            .filter_map(|pos| find_nearest_stop_on_trip(pos.lat, pos.lon, trip).map(|(idx, _)| idx))
             // Check if matched index is 'late' in the trip (near end)
             .any(|idx| idx >= late_threshold_idx);
 
@@ -552,10 +587,7 @@ fn classify_terminus_visits_for_trip(
             .iter()
             .skip(raw.position_idx + 1)
             .take(5)
-            .filter_map(|pos| {
-                find_nearest_stop_on_trip(pos.lat, pos.lon, &trip_stop_ids, gtfs)
-                    .map(|(idx, _, _)| idx)
-            })
+            .filter_map(|pos| find_nearest_stop_on_trip(pos.lat, pos.lon, trip).map(|(idx, _)| idx))
             // Check if matched index is 'early' in the trip (near start)
             .any(|idx| idx > 0 && idx <= EARLY_STOP_THRESHOLD);
 
@@ -592,17 +624,16 @@ fn find_segment_boundary(terminus_visits: &[TerminusVisit]) -> Option<usize> {
 fn score_trip_with_segmentation(
     state: &VehicleState,
     trip: &Trip,
-    gtfs: &GtfsData,
     segment_start: Option<usize>,
     terminus_visits: &[TerminusVisit],
-) -> (f64, bool) {
+) -> (f64, bool, Vec<Option<u64>>) {
     if state.position_history.is_empty() || trip.stop_times.is_empty() {
-        return (0.0, false);
+        return (0.0, false, Vec::new());
     }
 
     let start_idx = segment_start.unwrap_or(0);
     if state.position_history.len() - start_idx < MIN_POSITIONS_FOR_MATCHING {
-        return (0.0, false);
+        return (0.0, false, Vec::new());
     }
 
     let history_slice: Vec<_> = state.position_history.iter().skip(start_idx).collect();
@@ -622,11 +653,10 @@ fn score_trip_with_segmentation(
     };
 
     // Run Viterbi matching
-    let viterbi_result =
-        crate::matcher::viterbi::viterbi_score(&history_slice, trip, gtfs, &date_str);
+    let viterbi_result = crate::matcher::viterbi::viterbi_score(&history_slice, trip, &date_str);
 
     if viterbi_result.score == 0.0 {
-        return (0.0, false);
+        return (0.0, false, viterbi_result.matched_stops);
     }
 
     let get_sched_ts = |secs: u32| -> Option<i64> {
@@ -699,7 +729,7 @@ fn score_trip_with_segmentation(
         0.0
     };
 
-    let transition_detected = detect_transition_signature(state, trip, gtfs, terminus_visits);
+    let transition_detected = detect_transition_signature(state, trip, terminus_visits);
 
     let has_early_stops = matched_stops
         .iter()
@@ -714,26 +744,23 @@ fn score_trip_with_segmentation(
     // Combine Viterbi spatial score with time conformance
     let raw_score = viterbi_result.score * avg_time_score * early_bonus;
 
-    (raw_score.min(1.0), transition_detected)
+    (
+        raw_score.min(1.0),
+        transition_detected,
+        viterbi_result.matched_stops,
+    )
 }
 
 /// Detect if position history shows a transition from previous trip to this trip
 fn detect_transition_signature(
     state: &VehicleState,
     trip: &Trip,
-    gtfs: &GtfsData,
     terminus_visits: &[TerminusVisit],
 ) -> bool {
     // We need at least one terminus visit
     if terminus_visits.is_empty() {
         return false;
     }
-
-    let trip_stop_ids: Vec<String> = trip
-        .stop_times
-        .iter()
-        .map(|st| st.stop_id.clone())
-        .collect();
 
     // Find the most recent terminus visit
     let last_terminus = terminus_visits.last().unwrap();
@@ -748,9 +775,7 @@ fn detect_transition_signature(
         .take(last_terminus.position_idx)
         .rev()
         .take(10)
-        .filter_map(|pos| {
-            find_nearest_stop_on_trip(pos.lat, pos.lon, &trip_stop_ids, gtfs).map(|(idx, _, _)| idx)
-        })
+        .filter_map(|pos| find_nearest_stop_on_trip(pos.lat, pos.lon, trip).map(|(idx, _)| idx))
         .any(|idx| idx >= late_threshold_idx);
 
     // Check if positions after terminus match early stops
@@ -759,9 +784,7 @@ fn detect_transition_signature(
         .iter()
         .skip(last_terminus.position_idx + 1)
         .take(10)
-        .filter_map(|pos| {
-            find_nearest_stop_on_trip(pos.lat, pos.lon, &trip_stop_ids, gtfs).map(|(idx, _, _)| idx)
-        })
+        .filter_map(|pos| find_nearest_stop_on_trip(pos.lat, pos.lon, trip).map(|(idx, _)| idx))
         .any(|idx| idx > 0 && idx <= EARLY_STOP_THRESHOLD);
 
     pre_terminus_late && post_terminus_early
@@ -771,24 +794,15 @@ fn detect_transition_signature(
 fn history_shows_early_stops(
     state: &VehicleState,
     trip: &Trip,
-    gtfs: &GtfsData,
     segment_start: Option<usize>,
 ) -> bool {
-    let trip_stop_ids: Vec<String> = trip
-        .stop_times
-        .iter()
-        .map(|st| st.stop_id.clone())
-        .collect();
-
     let start_idx = segment_start.unwrap_or(0);
 
     state
         .position_history
         .iter()
         .skip(start_idx)
-        .filter_map(|pos| {
-            find_nearest_stop_on_trip(pos.lat, pos.lon, &trip_stop_ids, gtfs).map(|(idx, _, _)| idx)
-        })
+        .filter_map(|pos| find_nearest_stop_on_trip(pos.lat, pos.lon, trip).map(|(idx, _)| idx))
         .any(|idx| idx > 0 && idx <= EARLY_STOP_THRESHOLD)
 }
 

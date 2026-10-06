@@ -7,7 +7,7 @@ This runtime inserts trip IDs into the Passio realtime feed for the Irvine Conne
 The Passio realtime feed provides accurate vehicle positions, latitude, and heading but lacks accurate trip assignment. This service:
 
 1. Downloads the static GTFS schedule
-2. Polls vehicle positions every second
+2. Polls vehicle positions every half-second
 3. Assigns trip IDs by tracking which stops each vehicle passes
 4. Serves enhanced GTFS-RT via HTTP
 

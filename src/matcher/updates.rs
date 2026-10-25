@@ -9,6 +9,11 @@ const DWELL_EXIT_RADIUS_METERS: f64 = 70.0;
 const DWELL_EVIDENCE_WINDOW_SECS: u64 = 20;
 const MIN_DWELL_EVIDENCE_SECS: u64 = 8;
 const STATIONARY_MEDIAN_SPEED_MPS: f64 = 1.5;
+// Do not make live departure predictions from stale GPS observations.
+const MAX_POSITION_AGE_SECS: u64 = 45;
+// Keep a recently completed trip's final arrival briefly, without inventing
+// a departure during the layover for the following trip.
+const TERMINAL_ARRIVAL_GRACE_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct StopMotionEvidence {
@@ -81,7 +86,15 @@ fn generate_single_trip_update(
 ) -> Option<gtfs_realtime::TripUpdate> {
     let trip = gtfs.get_trip_by_id(trip_id)?;
     let stop_times = &trip.stop_times;
+    let final_stop_idx = stop_times.len().checked_sub(1)?;
     let date_str = state.assigned_start_date.as_ref()?;
+
+    // An old trip assignment must not keep producing predictions as wall time
+    // advances after the position feed has stopped updating.
+    let latest_position_ts = state.position_history.back()?.timestamp;
+    if current_time.saturating_sub(latest_position_ts) > MAX_POSITION_AGE_SECS {
+        return None;
+    }
 
     let mut trip_update = gtfs_realtime::TripUpdate::default();
     let mut trip_descriptor = gtfs_realtime::TripDescriptor::default();
@@ -112,6 +125,15 @@ fn generate_single_trip_update(
     let matched_stops = &state.matched_stop_timestamps;
     if matched_stops.len() != stop_times.len() {
         return None;
+    }
+
+    // The final stop is an arrival-only event for this trip. After a short
+    // grace period, omit the completed trip entirely. Otherwise a bus parked
+    // at the terminus can appear to be 40+ minutes late for its old trip.
+    if let Some(final_arrival_ts) = matched_stops[final_stop_idx] {
+        if current_time.saturating_sub(final_arrival_ts) > TERMINAL_ARRIVAL_GRACE_SECS {
+            return None;
+        }
     }
 
     let last_visited_idx = matched_stops.iter().rposition(Option::is_some);
@@ -200,10 +222,13 @@ fn generate_single_trip_update(
                 .map(|coords| analyze_stop_motion(state, coords, actual_arrival_ts, current_time))
                 .unwrap_or_default();
 
-            let is_current_stop = last_visited_idx == Some(i);
-            let mut departure_event = gtfs_realtime::trip_update::StopTimeEvent::default();
+            // GTFS trips end at their final stop. A departure from that stop
+            // belongs to another trip, not an indefinitely growing layover.
+            if i != final_stop_idx {
+                let is_current_stop = last_visited_idx == Some(i);
+                let mut departure_event = gtfs_realtime::trip_update::StopTimeEvent::default();
 
-            if is_current_stop && motion.dwelling {
+                if is_current_stop && motion.dwelling {
                 // We do not know the eventual departure yet. Publish the
                 // earliest physically possible departure (now) and the matching
                 // delay lower bound. This value advances every feed refresh.
@@ -237,7 +262,8 @@ fn generate_single_trip_update(
                     }
                 }
             }
-            stu.departure = Some(departure_event);
+                stu.departure = Some(departure_event);
+            }
         } else {
             // Future stop: propagate the best current departure-delay estimate.
             let mut arrival_event = gtfs_realtime::trip_update::StopTimeEvent::default();
@@ -262,7 +288,9 @@ fn generate_single_trip_update(
                     departure_event.time = Some(sched_ts as i64 + propagated_delay as i64);
                 }
             }
-            stu.departure = Some(departure_event);
+            if i != final_stop_idx {
+                stu.departure = Some(departure_event);
+            }
         }
 
         stu.schedule_relationship = Some(
@@ -292,28 +320,34 @@ fn analyze_stop_motion(
         return StopMotionEvidence::default();
     }
 
-    let latest = positions[positions.len() - 1];
-    let latest_distance = haversine_distance(latest.lat, latest.lon, stop_lat, stop_lon);
-
-    // Once the vehicle has clearly moved outside the hysteresis radius, treat
-    // the final in-radius observation as the departure event. The wider exit
-    // radius prevents ordinary GPS jitter from toggling dwell on/off.
-    if latest_distance >= DWELL_EXIT_RADIUS_METERS {
-        let departure_timestamp = positions
-            .iter()
-            .rev()
-            .find(|p| {
-                haversine_distance(p.lat, p.lon, stop_lat, stop_lon) <= DWELL_ENTER_RADIUS_METERS
-            })
-            .map(|p| p.timestamp);
-
-        return StopMotionEvidence {
-            dwelling: false,
-            departure_timestamp,
-        };
+    // Scan from the matched arrival forward, not just the latest position.
+    // A bus may leave a stop, complete a loop, and return to the same location
+    // much later. Using only the latest position wrongly treats that return as
+    // a continuous 40-minute dwell on the original stop event.
+    let mut last_inside_timestamp = None;
+    for pos in &positions {
+        let distance = haversine_distance(pos.lat, pos.lon, stop_lat, stop_lon);
+        if distance <= DWELL_ENTER_RADIUS_METERS {
+            last_inside_timestamp = Some(pos.timestamp);
+        } else if distance >= DWELL_EXIT_RADIUS_METERS {
+            if let Some(departure_timestamp) = last_inside_timestamp {
+                return StopMotionEvidence {
+                    dwelling: false,
+                    departure_timestamp: Some(departure_timestamp),
+                };
+            }
+        }
     }
 
-    if latest_distance > DWELL_ENTER_RADIUS_METERS {
+    // We must have observed this stop and still be inside its enter radius.
+    if last_inside_timestamp.is_none() {
+        return StopMotionEvidence::default();
+    }
+    let latest = positions[positions.len() - 1];
+    let latest_distance = haversine_distance(latest.lat, latest.lon, stop_lat, stop_lon);
+    if latest_distance > DWELL_ENTER_RADIUS_METERS
+        || current_time.saturating_sub(latest.timestamp) > MAX_POSITION_AGE_SECS
+    {
         return StopMotionEvidence::default();
     }
 
@@ -427,4 +461,141 @@ mod tests {
         let live_delay = arrival_delay.max(clamp_delay(now - scheduled_departure));
         assert_eq!(live_delay, 300);
     }
+
+    fn test_gtfs(scheduled_secs: &[u32]) -> GtfsData {
+        use crate::gtfs::{Stop, StopTime, Trip};
+        use std::collections::HashMap;
+
+        let mut stops = HashMap::new();
+        let mut times = Vec::new();
+        for (idx, &secs) in scheduled_secs.iter().enumerate() {
+            let stop_id = format!("stop-{idx}");
+            stops.insert(
+                stop_id.clone(),
+                Stop {
+                    id: stop_id.clone(),
+                    name: stop_id.clone(),
+                    lat: 33.65 + idx as f64 * 0.005,
+                    lon: -117.83,
+                },
+            );
+            let time = format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60);
+            times.push(StopTime {
+                stop_id,
+                sequence: idx as u32 + 1,
+                arrival_time: time.clone(),
+                arrival_time_secs: Some(secs),
+                departure_time: time,
+                departure_time_secs: Some(secs),
+            });
+        }
+
+        let trip = Trip::new(
+            "test-trip".to_string(),
+            "test-route".to_string(),
+            "Weekday".to_string(),
+            "test-block".to_string(),
+            times,
+            &stops,
+        );
+        GtfsData::new(stops, vec![trip], HashMap::new(), vec![0], vec![])
+    }
+
+    fn assigned_state(matched: Vec<Option<u64>>) -> VehicleState {
+        let mut state = VehicleState::new("bus".to_string());
+        state.assigned_trip_id = Some("test-trip".to_string());
+        state.assigned_start_date = Some("20261022".to_string());
+        state.matched_stop_timestamps = matched;
+        state
+    }
+
+    #[test]
+    fn final_stop_reports_arrival_but_never_a_departure() {
+        let gtfs = test_gtfs(&[11 * 3600 + 50 * 60, 12 * 3600]);
+        let scheduled = get_scheduled_timestamp("20261022", 12 * 3600).unwrap();
+        let arrived = scheduled - 60;
+        let mut state = assigned_state(vec![None, Some(arrived)]);
+        let (lat, lon) = gtfs.trips[0].stop_coords[1].unwrap();
+        add_position(&mut state, lat, lon, arrived);
+        add_position(&mut state, lat, lon, scheduled + 20);
+
+        let update = generate_single_trip_update(&gtfs, &state, "test-trip", scheduled + 30).unwrap();
+        let terminal = &update.stop_time_update[1];
+        assert_eq!(terminal.arrival.as_ref().unwrap().delay, Some(-60));
+        assert_eq!(terminal.arrival.as_ref().unwrap().time, Some(arrived as i64));
+        assert!(terminal.departure.is_none());
+    }
+
+    #[test]
+    fn completed_trip_does_not_accrue_forty_minute_terminal_delay() {
+        let gtfs = test_gtfs(&[11 * 3600 + 50 * 60, 12 * 3600]);
+        let scheduled = get_scheduled_timestamp("20261022", 12 * 3600).unwrap();
+        let arrived = scheduled - 60;
+        let now = scheduled + 40 * 60;
+        let mut state = assigned_state(vec![None, Some(arrived)]);
+        let (lat, lon) = gtfs.trips[0].stop_coords[1].unwrap();
+        add_position(&mut state, lat, lon, arrived);
+        add_position(&mut state, lat, lon, now - 10);
+        add_position(&mut state, lat, lon, now);
+
+        assert!(generate_single_trip_update(&gtfs, &state, "test-trip", now).is_none());
+    }
+
+    #[test]
+    fn bus_returning_to_same_stop_does_not_count_as_continuous_dwell() {
+        let gtfs = test_gtfs(&[11 * 3600 + 50 * 60, 12 * 3600, 12 * 3600 + 10 * 60]);
+        let scheduled = get_scheduled_timestamp("20261022", 12 * 3600).unwrap();
+        let arrived = scheduled - 60;
+        let now = scheduled + 40 * 60;
+        let mut state = assigned_state(vec![None, Some(arrived), None]);
+        let (lat, lon) = gtfs.trips[0].stop_coords[1].unwrap();
+        add_position(&mut state, lat, lon, arrived);
+        add_position(&mut state, lat, lon, arrived + 5);
+        add_position(&mut state, lat + 0.005, lon, arrived + 15);
+        add_position(&mut state, lat, lon, now - 10);
+        add_position(&mut state, lat, lon, now - 5);
+        add_position(&mut state, lat, lon, now);
+
+        let evidence = analyze_stop_motion(&state, (lat, lon), arrived, now);
+        assert!(!evidence.dwelling);
+        assert_eq!(evidence.departure_timestamp, Some(arrived + 5));
+
+        let update = generate_single_trip_update(&gtfs, &state, "test-trip", now).unwrap();
+        assert_eq!(update.stop_time_update[1].arrival.as_ref().unwrap().delay, Some(-60));
+        assert_eq!(update.stop_time_update[1].departure.as_ref().unwrap().delay, Some(-55));
+        assert_eq!(update.stop_time_update[2].arrival.as_ref().unwrap().delay, Some(-55));
+        assert!(update.stop_time_update[2].departure.is_none());
+    }
+
+    #[test]
+    fn real_intermediate_dwell_still_increases_departure_delay() {
+        let gtfs = test_gtfs(&[12 * 3600, 12 * 3600 + 10 * 60]);
+        let scheduled = get_scheduled_timestamp("20261022", 12 * 3600).unwrap();
+        let arrived = scheduled - 60;
+        let now = scheduled + 300;
+        let mut state = assigned_state(vec![Some(arrived), None]);
+        let (lat, lon) = gtfs.trips[0].stop_coords[0].unwrap();
+        add_position(&mut state, lat, lon, arrived);
+        for offset in [15, 10, 5, 0] {
+            add_position(&mut state, lat, lon, now - offset);
+        }
+
+        let update = generate_single_trip_update(&gtfs, &state, "test-trip", now).unwrap();
+        assert_eq!(update.stop_time_update[0].arrival.as_ref().unwrap().delay, Some(-60));
+        assert_eq!(update.stop_time_update[0].departure.as_ref().unwrap().delay, Some(300));
+        assert_eq!(update.stop_time_update[1].arrival.as_ref().unwrap().delay, Some(300));
+        assert!(update.stop_time_update[1].departure.is_none());
+    }
+
+    #[test]
+    fn stale_position_does_not_create_live_trip_update() {
+        let gtfs = test_gtfs(&[12 * 3600, 12 * 3600 + 10 * 60]);
+        let scheduled = get_scheduled_timestamp("20261022", 12 * 3600).unwrap();
+        let mut state = assigned_state(vec![Some(scheduled - 60), None]);
+        let (lat, lon) = gtfs.trips[0].stop_coords[0].unwrap();
+        add_position(&mut state, lat, lon, scheduled - 60);
+
+        assert!(generate_single_trip_update(&gtfs, &state, "test-trip", scheduled + 300).is_none());
+    }
+
 }

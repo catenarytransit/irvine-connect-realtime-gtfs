@@ -41,7 +41,7 @@ pub async fn run_server(
         .route("/health", get(health_check))
         .layer(CorsLayer::permissive());
 
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("[::]:{}", port);
     println!("Starting HTTP server on {}", addr);
 
     let listener = match tokio::net::TcpListener::bind(&addr).await {

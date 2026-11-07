@@ -1,9 +1,6 @@
 use crate::gtfs::Trip;
 use crate::matcher::history::TimestampedPosition;
 use crate::matcher::proximity::haversine_distance;
-use chrono::TimeDelta;
-use chrono::TimeZone;
-use chrono_tz::America::Los_Angeles;
 
 const GPS_SIGMA_Z: f64 = 25.0;
 const TRANSITION_BETA: f64 = 200.0;
@@ -31,11 +28,12 @@ fn route_distance(cumulative: &[f64], from: usize, to: usize) -> f64 {
 
 /// Compute the base timestamp for a service date (midnight LA time).
 fn service_day_base(date_str: &str) -> Option<i64> {
-    use chrono::NaiveDate;
-    let date = NaiveDate::parse_from_str(date_str, "%Y%m%d").ok()?;
-    let naive_dt = date.and_hms_opt(12, 0, 0)? - TimeDelta::try_seconds(43200).unwrap();
-    let base_dt = Los_Angeles.from_local_datetime(&naive_dt).single()?;
-    Some(base_dt.timestamp())
+    let date = jiff::civil::Date::strptime("%Y%m%d", date_str).ok()?;
+    let base = date
+        .at(0, 0, 0, 0)
+        .to_zoned(crate::timezone::get("America/Los_Angeles"))
+        .ok()?;
+    Some(base.timestamp().as_second())
 }
 
 /// Temporal emission penalty: penalizes a stop match when the GPS timestamp

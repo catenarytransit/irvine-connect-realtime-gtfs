@@ -1,7 +1,5 @@
 use crate::gtfs::GtfsData;
 use crate::matcher::{VehicleStateManager, algorithm, updates};
-use chrono::Timelike;
-use chrono::Utc;
 use prost::Message;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -87,9 +85,10 @@ pub async fn run_fetcher(
     let mut current_iteration = 0;
 
     loop {
-        let now_utc = Utc::now();
-        let current_california_local_time = now_utc.with_timezone(&chrono_tz::America::Los_Angeles);
-        let hour: u32 = current_california_local_time.hour();
+        let now_utc = jiff::Timestamp::now();
+        let current_california_local_time =
+            now_utc.to_zoned(crate::timezone::get("America/Los_Angeles"));
+        let hour: u32 = current_california_local_time.hour() as u32;
 
         if hour < 5 || hour > 23 {
             //dont do anything this early

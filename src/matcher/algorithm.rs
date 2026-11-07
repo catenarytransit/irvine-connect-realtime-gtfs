@@ -1,8 +1,8 @@
 use crate::gtfs::{GtfsData, Trip};
 use crate::matcher::history::VehicleState;
 use crate::matcher::proximity::{find_nearest_stop_on_trip, haversine_distance};
-use chrono::{Datelike, TimeZone, Timelike};
-use chrono_tz::America::Los_Angeles;
+use crate::timezone;
+use jiff::{Timestamp, civil::Date};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::SystemTime;
 
@@ -109,13 +109,15 @@ pub fn perform_global_assignment(
                 None => continue,
             };
 
-            let la_time = Los_Angeles
-                .timestamp_opt(last_pos.timestamp as i64, 0)
-                .single();
+            let la_time = Timestamp::from_second(last_pos.timestamp as i64)
+                .ok()
+                .map(|ts| ts.to_zoned(timezone::get("America/Los_Angeles")));
 
             if let Some(now) = la_time {
-                let is_weekend = now.weekday().num_days_from_monday() >= 5;
-                let current_secs = (now.hour() * 3600 + now.minute() * 60 + now.second()) as u32;
+                let is_weekend = now.weekday().to_monday_zero_offset() >= 5;
+                let current_secs = (i32::from(now.hour()) * 3600
+                    + i32::from(now.minute()) * 60
+                    + i32::from(now.second())) as u32;
 
                 let mut candidates = find_candidate_trips(gtfs, is_weekend, current_secs);
 
@@ -202,7 +204,8 @@ pub fn perform_global_assignment(
 
                         // Calculate correct start date based on service day logic
                         let trip_start_mins = trip.start_time_minutes().unwrap_or(0);
-                        let current_mins = (now.hour() * 60 + now.minute()) as u32;
+                        let current_mins =
+                            (i32::from(now.hour()) * 60 + i32::from(now.minute())) as u32;
 
                         // If trip starts late (e.g. 25:00) and it's early (e.g. 01:00),
                         // then delta is large positive (25*60 - 1*60 = 24*60 = 1440).
@@ -213,20 +216,20 @@ pub fn perform_global_assignment(
 
                         let service_date = if delta > 720 {
                             // More than 12 hours ahead -> Previous Day (e.g. 25:00 trip at 01:00)
-                            now.date_naive()
-                                .pred_opt()
+                            now.date()
+                                .yesterday()
                                 .unwrap()
-                                .format("%Y%m%d")
+                                .strftime("%Y%m%d")
                                 .to_string()
                         } else if delta < -720 {
                             // More than 12 hours behind -> Next Day (e.g. 00:05 trip at 23:55)
-                            now.date_naive()
-                                .succ_opt()
+                            now.date()
+                                .tomorrow()
                                 .unwrap()
-                                .format("%Y%m%d")
+                                .strftime("%Y%m%d")
                                 .to_string()
                         } else {
-                            now.format("%Y%m%d").to_string()
+                            now.strftime("%Y%m%d").to_string()
                         };
 
                         all_matches.push(CandidateMatch {
@@ -368,14 +371,16 @@ pub fn perform_global_assignment(
 
             if let Some(state) = state_manager.get(vehicle_id) {
                 if let Some(last_pos) = state.position_history.back() {
-                    let la_time = Los_Angeles
-                        .timestamp_opt(last_pos.timestamp as i64, 0)
-                        .single();
+                    let la_time = Timestamp::from_second(last_pos.timestamp as i64)
+                        .ok()
+                        .map(|ts| ts.to_zoned(timezone::get("America/Los_Angeles")));
 
                     if let Some(now) = la_time {
-                        let current_secs =
-                            (now.hour() * 3600 + now.minute() * 60 + now.second()) as u32;
-                        let is_weekend = now.weekday().num_days_from_monday() >= 5;
+                        let current_secs = (i32::from(now.hour()) * 3600
+                            + i32::from(now.minute()) * 60
+                            + i32::from(now.second()))
+                            as u32;
+                        let is_weekend = now.weekday().to_monday_zero_offset() >= 5;
 
                         let nearby_stop_ids: Vec<&String> = gtfs
                             .stops
@@ -392,7 +397,7 @@ pub fn perform_global_assignment(
 
                             for &idx in active_trips {
                                 let trip = &gtfs.trips[idx];
-                                let date_str = now.format("%Y%m%d").to_string();
+                                let date_str = now.strftime("%Y%m%d").to_string();
                                 if assigned_trips
                                     .contains(&(trip.trip_id.clone(), date_str.clone()))
                                 {
@@ -430,7 +435,7 @@ pub fn perform_global_assignment(
                             }
 
                             if let Some((trip, score, matched_stops)) = best_fallback {
-                                let date = now.format("%Y%m%d").to_string();
+                                let date = now.strftime("%Y%m%d").to_string();
                                 assigned_vehicles.insert(vehicle_id.clone());
                                 assigned_trips.insert((trip.trip_id.clone(), date.clone()));
                                 final_assignments.insert(
@@ -642,10 +647,10 @@ fn score_trip_with_segmentation(
         d.clone()
     } else {
         if let Some(last_pos) = history_slice.last() {
-            Los_Angeles
-                .timestamp_opt(last_pos.timestamp as i64, 0)
-                .single()
-                .map(|dt| dt.format("%Y%m%d").to_string())
+            Timestamp::from_second(last_pos.timestamp as i64)
+                .ok()
+                .map(|ts| ts.to_zoned(timezone::get("America/Los_Angeles")))
+                .map(|dt| dt.strftime("%Y%m%d").to_string())
                 .unwrap_or_else(|| "20240101".to_string())
         } else {
             "20240101".to_string()
@@ -660,16 +665,12 @@ fn score_trip_with_segmentation(
     }
 
     let get_sched_ts = |secs: u32| -> Option<i64> {
-        use chrono::NaiveDate;
-        if let Ok(date) = NaiveDate::parse_from_str(&date_str, "%Y%m%d") {
-            if let Some(naive_dt) = date.and_hms_opt(0, 0, 0) {
-                if let Some(base_dt) = Los_Angeles.from_local_datetime(&naive_dt).single() {
-                    let sched_dt = base_dt + chrono::Duration::seconds(secs as i64);
-                    return Some(sched_dt.timestamp());
-                }
-            }
-        }
-        None
+        let date = Date::strptime("%Y%m%d", &date_str).ok()?;
+        let base = date
+            .at(0, 0, 0, 0)
+            .to_zoned(timezone::get("America/Los_Angeles"))
+            .ok()?;
+        base.timestamp().as_second().checked_add(i64::from(secs))
     };
 
     let stop_times = &trip.stop_times;

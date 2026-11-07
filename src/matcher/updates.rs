@@ -37,24 +37,20 @@ pub fn generate_trip_updates(gtfs: &GtfsData, states: &VehicleStateManager) -> F
                 // Filter out stale trip updates
                 let trip = &trip_update.trip;
                 if let Some(start_date) = &trip.start_date {
-                    use chrono::{Datelike, TimeZone};
-                    use chrono_tz::America::Los_Angeles;
-
-                    let now = SystemTime::now();
-                    let now_utc = chrono::DateTime::<chrono::Utc>::from(now);
-                    let now_la = now_utc.with_timezone(&Los_Angeles);
-                    let today = now_la.format("%Y%m%d").to_string();
+                    let now_la = jiff::Timestamp::now()
+                        .to_zoned(crate::timezone::get("America/Los_Angeles"));
+                    let today = now_la.strftime("%Y%m%d").to_string();
                     let yesterday = now_la
-                        .date_naive()
-                        .pred_opt()
+                        .date()
+                        .yesterday()
                         .unwrap()
-                        .format("%Y%m%d")
+                        .strftime("%Y%m%d")
                         .to_string();
                     let tomorrow = now_la
-                        .date_naive()
-                        .succ_opt()
+                        .date()
+                        .tomorrow()
                         .unwrap()
-                        .format("%Y%m%d")
+                        .strftime("%Y%m%d")
                         .to_string();
 
                     if *start_date != today && *start_date != yesterday && *start_date != tomorrow {
@@ -367,15 +363,17 @@ fn clamp_delay(delay: i64) -> i32 {
 }
 
 fn get_scheduled_timestamp(date_str: &str, secs_since_midnight: u32) -> Result<u64, ()> {
-    use chrono::{NaiveDate, TimeZone};
-    use chrono_tz::America::Los_Angeles;
-
-    let date = NaiveDate::parse_from_str(date_str, "%Y%m%d").map_err(|_| ())?;
-    let naive_dt = date.and_hms_opt(0, 0, 0).unwrap();
-    let base_dt = Los_Angeles.from_local_datetime(&naive_dt).single().unwrap();
-    let scheduled_dt = base_dt + chrono::Duration::seconds(secs_since_midnight as i64);
-
-    Ok(scheduled_dt.timestamp() as u64)
+    let date = jiff::civil::Date::strptime("%Y%m%d", date_str).map_err(|_| ())?;
+    let base = date
+        .at(0, 0, 0, 0)
+        .to_zoned(crate::timezone::get("America/Los_Angeles"))
+        .map_err(|_| ())?;
+    let seconds = base
+        .timestamp()
+        .as_second()
+        .checked_add(i64::from(secs_since_midnight))
+        .ok_or(())?;
+    u64::try_from(seconds).map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -426,5 +424,24 @@ mod tests {
 
         let live_delay = arrival_delay.max(clamp_delay(now - scheduled_departure));
         assert_eq!(live_delay, 300);
+    }
+}
+
+#[cfg(test)]
+mod jiff_regressions {
+    use super::*;
+    #[test]
+    fn overnight_stop_times_add_elapsed_seconds_across_dst() {
+        let base = get_scheduled_timestamp("20260308", 0).unwrap();
+        let expected = "2026-03-08T08:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_second() as u64;
+        assert_eq!(base, expected);
+        assert_eq!(
+            get_scheduled_timestamp("20260308", 90_000).unwrap(),
+            expected + 90_000
+        );
+        assert!(get_scheduled_timestamp("invalid", 0).is_err());
     }
 }

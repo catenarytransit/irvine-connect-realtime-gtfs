@@ -2,6 +2,7 @@ mod api;
 mod gtfs;
 mod matcher;
 mod realtime;
+mod timezone;
 
 use clap::Parser;
 use std::sync::Arc;
